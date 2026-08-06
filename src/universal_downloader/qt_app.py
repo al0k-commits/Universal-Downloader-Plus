@@ -4,7 +4,8 @@ Universal Downloader+ — 4K Video Downloader+ style desktop app.
 PyQt6 + QWebEngine in-app browser with ad-blocking, download manager,
 detailed format-selection modal, pause/resume/cancel via yt-dlp hooks.
 
-Requires ffmpeg.exe / ffprobe.exe next to this script.
+Requires ffmpeg.exe / ffprobe.exe / yt-dlp.exe inside the ffmpeg/ folder at the
+repository root (dev) or next to the frozen executable (PyInstaller build).
 """
 
 import os
@@ -37,11 +38,18 @@ from PyQt6.QtWebEngineWidgets import QWebEngineView
 
 def get_base_dir() -> str:
     if getattr(sys, "frozen", False):
+        # Running as a PyInstaller executable: binaries sit next to the exe.
         return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+    # Running from source: traverse up from
+    # src/universal_downloader/qt_app.py to the repository root.
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
 BASE_DIR = get_base_dir()
+
+# Third-party binaries (ffmpeg.exe, ffprobe.exe, yt-dlp.exe) live here.
+# In dev this is <repo_root>/ffmpeg; when frozen it is <exe_dir>/ffmpeg.
+FFMPEG_DIR = os.path.join(BASE_DIR, "ffmpeg")
 
 AD_DOMAINS = (
     "doubleclick.net", "googlesyndication.com", "googleadservices.com",
@@ -499,7 +507,7 @@ class DownloadModal(QDialog):
 
         opts = {
             "outtmpl": outtmpl,
-            "ffmpeg_location": BASE_DIR,
+            "ffmpeg_location": FFMPEG_DIR,
             "quiet": True,
             "no_warnings": True,
             "noplaylist": not is_playlist,
@@ -1036,7 +1044,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self, "Settings",
             f"Save directory: {self.save_dir}\n"
-            f"ffmpeg: {os.path.join(BASE_DIR, 'ffmpeg.exe')}\n"
+            f"ffmpeg: {FFMPEG_DIR}\n"
             f"Ad blocking: enabled\n"
             f"Theme: {'Dark' if self.dark else 'Light'}")
 
@@ -1118,7 +1126,7 @@ class MainWindow(QMainWindow):
 
         opts = {
             "outtmpl": outtmpl,
-            "ffmpeg_location": BASE_DIR,
+            "ffmpeg_location": FFMPEG_DIR,
             "quiet": True,
             "no_warnings": True,
             "noplaylist": not is_playlist,
@@ -1205,10 +1213,16 @@ def main():
     win = MainWindow()
     win.apply_theme()  # sync icons/tooltips with the dark default
 
-    if not os.path.exists(os.path.join(BASE_DIR, "ffmpeg.exe")):
+    missing = [
+        name for name in ("ffmpeg.exe", "ffprobe.exe", "yt-dlp.exe")
+        if not os.path.exists(os.path.join(FFMPEG_DIR, name))
+    ]
+    if missing:
         QMessageBox.warning(
             win, "ffmpeg missing",
-            "ffmpeg.exe not found next to the script.\n"
+            "The following binaries were not found in:\n"
+            f"{FFMPEG_DIR}\n\n"
+            f"Missing: {', '.join(missing)}\n\n"
             "Merging video+audio and MP3 extraction will fail.")
 
     win.show()

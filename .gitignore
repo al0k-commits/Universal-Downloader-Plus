@@ -1,36 +1,35 @@
 # ─────────────────────────────────────────────────────────────────────
-# Universal Downloader — .gitignore
+# Universal Downloader Plus — .gitignore
 # Python / PyQt6 / PyInstaller / yt-dlp / ffmpeg project
 # ─────────────────────────────────────────────────────────────────────
 
-# ── Byte-compiled / cached Python ──
+# ── Python bytecode / caches ──
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+
+# ── Packaging & build artifacts (PyInstaller) ──
 build/
-develop-eggs/
 dist/
-downloads.eggs/
+*.spec
+*.spec~
+*.manifest
+*.egg-info/
+*.egg
+*.whl
 .eggs/
+develop-eggs/
+downloads.eggs/
 lib/
 lib64/
 parts/
 sdist/
 var/
 wheels/
-*.egg-info/
 .installed.cfg
-*.egg
 MANIFEST
-
-# ── Packaging / build artifacts (PyInstaller) ──
-build/
-dist/
-*.spec
-*.manifest
-*.spec~
 
 # ── Virtual environments ──
 .env
@@ -41,12 +40,7 @@ env/
 .venv.bak/
 venv.bak/
 
-# ── Distribution / install logs ──
-pip-log.txt
-pip-delete-this-directory.txt
-*.whl
-
-# ── Test / coverage ──
+# ── Test / coverage / linters ──
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
@@ -91,29 +85,33 @@ secrets.json
 config.local.json
 .env.local
 
-# ── Binaries, standalone downloaders & media (NEVER commit) ──
-*.exe
-*.bin
-*.dll
-*.so
-*.dylib
-*.app
-
-# ffmpeg / ffprobe / yt-dlp standalone binaries
+# ── Standalone binaries: ffmpeg & yt-dlp ──
 ffmpeg/
+!ffmpeg/
+!ffmpeg/README.md
 ffmpeg.exe
 ffmpeg.zip
 ffprobe.exe
+ffprobe
 yt-dlp
 yt-dlp.exe
 yt-dlp_linux
 yt-dlp_macos
 yt-dlp_win.exe
 
-# Downloaded media & thumbnails (app output)
+# ── Compiled / binary executables ──
+*.exe
+*.bin
+*.dll
+*.dylib
+*.app
+
+# ── Downloaded media & thumbnails (app output) ──
 *.mp4
 *.mkv
 *.webm
+*.mov
+*.avi
 *.mp3
 *.m4a
 *.aac
@@ -126,4 +124,6 @@ yt-dlp_win.exe
 *.png
 *.gif
 *.webp
+
+# Keep legit image assets that ship with the app
 !src/universal_downloader/resources/**

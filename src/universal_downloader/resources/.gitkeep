@@ -1,0 +1,3 @@
+# Keep the resources/ directory tracked so the .gitignore exception
+# (!src/universal_downloader/resources/**) has a real path to match.
+# Drop application icons / UI assets in this folder.

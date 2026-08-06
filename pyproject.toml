@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "universal-downloader-plus"
+version = "1.0.0"
+description = "PyQt6 + yt-dlp video downloader with an in-app browser, ad-blocking, and pause/resume/cancel downloads."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Universal Downloader+ contributors" }]
+keywords = ["youtube", "downloader", "pyqt6", "yt-dlp", "video"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications :: Qt",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Internet :: WWW/HTTP",
+]
+dependencies = [
+    "PyQt6>=6.6.0",
+    "PyQt6-WebEngine>=6.6.0",
+    "qtawesome>=1.3.0",
+    "pyqtdarktheme>=2.1.0",
+    "yt-dlp>=2025.1.1",
+    "requests>=2.31.0",
+    "Pillow>=10.0.0",
+    "customtkinter>=5.2.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+universal-downloader = "universal_downloader.qt_app:main"
+universal-downloader-tk = "universal_downloader.app:main"
+
+[project.urls]
+Homepage = "https://github.com/your-user/universal-downloader-plus"
+Repository = "https://github.com/your-user/universal-downloader-plus"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import time
+import ctypes
 
 import requests
 import yt_dlp
@@ -19,7 +20,7 @@ import qtawesome as qta
 import qdarktheme
 
 from PyQt6.QtCore import Qt, QUrl, QThread, pyqtSignal, QSize
-from PyQt6.QtGui import QPixmap, QClipboard
+from PyQt6.QtGui import QPixmap, QClipboard, QIcon
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QDialog, QLabel, QPushButton,
     QLineEdit, QComboBox, QCheckBox, QProgressBar, QFileDialog, QFrame,
@@ -46,6 +47,20 @@ def get_base_dir() -> str:
 
 
 BASE_DIR = get_base_dir()
+
+# Application assets (icon.png, icon.ico, ...) live in resources/.
+# In dev this is src/universal_downloader/resources; when frozen by PyInstaller
+# the bundled folder is extracted to sys._MEIPASS/resources.
+def get_resource_path(filename: str) -> str:
+    """Resolve a file path inside the bundled resources/ folder."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        base = sys._MEIPASS
+    else:
+        # __file__ is .../src/universal_downloader/qt_app.py; resources/ is a
+        # sibling of this module inside the same package directory.
+        base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "resources")
+    return os.path.join(base, filename)
+
 
 # Third-party binaries (ffmpeg.exe, ffprobe.exe, yt-dlp.exe) live here.
 # In dev this is <repo_root>/ffmpeg; when frozen it is <exe_dir>/ffmpeg.
@@ -1207,11 +1222,32 @@ class MainWindow(QMainWindow):
 # ============================================================================
 
 def main():
+    # Force Windows to use our custom icon in the taskbar instead of the
+    # default Python logo. Must run before the QApplication/window is created.
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "mycompany.universaldownloader.1.0"
+        )
+    except (AttributeError, OSError):
+        # Not on Windows, or the call is unavailable — safe to ignore.
+        pass
+
     qdarktheme.enable_hi_dpi()
     app = QApplication(sys.argv)
+
+    # Application icon (taskbar / system tray). Use the .ico so Windows picks
+    # the correct native resolution for the taskbar and title bar.
+    app_icon_path = get_resource_path("icon.ico")
+    if os.path.exists(app_icon_path):
+        app.setWindowIcon(QIcon(app_icon_path))
+
     qdarktheme.setup_theme("dark", additional_qss=CUSTOM_QSS)
     win = MainWindow()
     win.apply_theme()  # sync icons/tooltips with the dark default
+
+    # Window icon (top-left of the main window).
+    if os.path.exists(app_icon_path):
+        win.setWindowIcon(QIcon(app_icon_path))
 
     missing = [
         name for name in ("ffmpeg.exe", "ffprobe.exe", "yt-dlp.exe")

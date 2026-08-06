@@ -13,19 +13,20 @@ import re
 import sys
 import time
 import ctypes
+import subprocess
 
 import requests
 import yt_dlp
 import qtawesome as qta
 import qdarktheme
 
-from PyQt6.QtCore import Qt, QUrl, QThread, pyqtSignal, QSize
-from PyQt6.QtGui import QPixmap, QClipboard, QIcon
+from PyQt6.QtCore import Qt, QUrl, QThread, pyqtSignal, QSize, QPropertyAnimation, QEasingCurve, pyqtProperty
+from PyQt6.QtGui import QPixmap, QClipboard, QIcon, QPainter, QColor, QBrush, QPen, QDesktopServices
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QDialog, QLabel, QPushButton,
     QLineEdit, QComboBox, QCheckBox, QProgressBar, QFileDialog, QFrame,
     QVBoxLayout, QHBoxLayout, QGridLayout, QStackedWidget, QScrollArea,
-    QRadioButton, QButtonGroup, QSizePolicy, QMessageBox, QToolButton,
+    QSizePolicy, QMessageBox, QToolButton,
 )
 from PyQt6.QtWebEngineCore import (
     QWebEngineUrlRequestInterceptor, QWebEngineProfile, QWebEngineScript,
@@ -178,6 +179,111 @@ QFrame#card { border-radius: 10px; }
 """
 
 
+# ============================================================================
+# Custom toggle switch (iOS/macOS style pill)
+# ============================================================================
+
+class ToggleSwitch(QWidget):
+    """Animated pill-style toggle switch with an adjacent label."""
+
+    toggled = pyqtSignal(bool)
+
+    _PILL_W = 46
+    _PILL_H = 26
+    _KNOB_R = 10
+    _MARGIN = 3
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self._checked = False
+        self._knob_x = float(self._MARGIN)
+
+        self._label = QLabel(text, self)
+        self._label.setStyleSheet("font-size: 13px;")
+
+        self.setFixedHeight(self._PILL_H + 4)
+        self._update_width()
+
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Toggle on/off")
+
+        # --- animation ---
+        self._anim = QPropertyAnimation(self, b"knobX")
+        self._anim.setDuration(180)
+        self._anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+
+    # -- public API (drop-in for QCheckBox) -------------------------------
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def setChecked(self, on: bool):
+        if on == self._checked:
+            return
+        self._checked = on
+        self._animate()
+        self.toggled.emit(on)
+
+    def toggle(self):
+        self.setChecked(not self._checked)
+
+    # -- animation helpers -------------------------------------------------
+    def _animate(self):
+        self._anim.stop()
+        target = self._PILL_W - self._KNOB_R * 2 - self._MARGIN if self._checked else self._MARGIN
+        self._anim.setStartValue(self._knob_x)
+        self._anim.setEndValue(target)
+        self._anim.start()
+
+    @pyqtProperty(float)
+    def knobX(self):
+        return self._knob_x
+
+    @knobX.setter
+    def knobX(self, x):
+        self._knob_x = x
+        self.update()
+
+    # -- geometry ----------------------------------------------------------
+    def _update_width(self):
+        self.setFixedWidth(self._PILL_W + 8 + self._label.sizeHint().width())
+
+    def sizeHint(self):
+        return QSize(
+            self._PILL_W + 8 + self._label.sizeHint().width(),
+            self._PILL_H + 4,
+        )
+
+    # -- events ------------------------------------------------------------
+    def mousePressEvent(self, _event):
+        self.toggle()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # pill background
+        pill_x = 0
+        pill_y = (self.height() - self._PILL_H) // 2
+        pill_rect_w = self._PILL_W
+        pill_rect_h = self._PILL_H
+
+        bg = QColor("#2ea44f") if self._checked else QColor("#555555")
+        p.setBrush(QBrush(bg))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(pill_x, pill_y, pill_rect_w, pill_rect_h,
+                          pill_rect_h // 2, pill_rect_h // 2)
+
+        # knob
+        knob_y = self.height() // 2 - self._KNOB_R
+        p.setBrush(QBrush(QColor("white")))
+        p.drawEllipse(int(self._knob_x), knob_y,
+                      self._KNOB_R * 2, self._KNOB_R * 2)
+
+        # label
+        self._label.move(pill_rect_w + 8, 0)
+        p.end()
+
+
 def human_size(n) -> str:
     if not n:
         return "?"
@@ -268,7 +374,7 @@ class AnalyzeWorker(QThread):
 class DownloadWorker(QThread):
     """Runs yt-dlp; pause via flag loop, cancel via exception in hook."""
     progress = pyqtSignal(dict)
-    done = pyqtSignal(bool, str)
+    done = pyqtSignal(bool, str, str)   # ok, message, file_path
 
     def __init__(self, url: str, ydl_opts: dict):
         super().__init__()
@@ -304,17 +410,61 @@ class DownloadWorker(QThread):
             opts = self.ydl_opts
             opts["progress_hooks"] = [self._hook]
             with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([self.url])
-            self.done.emit(True, "Completed")
+                info_dict = ydl.extract_info(self.url, download=True)
+
+            final_path = None
+            if "requested_downloads" in info_dict:
+                final_path = info_dict["requested_downloads"][0].get("filepath")
+            if not final_path:
+                final_path = info_dict.get("filepath") or info_dict.get("_filename")
+            final_path = os.path.normpath(final_path) if final_path else ""
+
+            print(f"Final merged path: {final_path}")
+            self.done.emit(True, "Completed", final_path)
         except DownloadCancelled:
-            self.done.emit(False, "Cancelled")
+            self.done.emit(False, "Cancelled", "")
         except yt_dlp.utils.DownloadError as e:
             if "cancelled by user" in str(e).lower():
-                self.done.emit(False, "Cancelled")
+                self.done.emit(False, "Cancelled", "")
             else:
-                self.done.emit(False, str(e).replace("ERROR:", "").strip()[:200])
+                self.done.emit(False, str(e).replace("ERROR:", "").strip()[:200], "")
         except Exception as e:
-            self.done.emit(False, str(e)[:200])
+            self.done.emit(False, str(e)[:200], "")
+
+
+def _recommend_format(formats: list, is_audio: bool = False) -> dict | None:
+    """Pick the best format based on the download type.
+
+    Video: prioritizes h264/avc codecs, then highest height, then fps.
+    Audio: prioritizes formats with a codec (acodec != none), highest bitrate.
+    Returns the winning format dict, or None if no suitable formats exist.
+    """
+    best = None
+    if is_audio:
+        for f in formats:
+            if f.get("acodec") in (None, "none"):
+                continue
+            abr = f.get("abr") or f.get("tbr") or 0
+            if best is None:
+                best = (abr, f)
+                continue
+            if abr > best[0]:
+                best = (abr, f)
+    else:
+        for f in formats:
+            if f.get("vcodec") in (None, "none") or not f.get("height"):
+                continue
+            vcodec = (f.get("vcodec") or "").lower()
+            is_h264 = "h264" in vcodec or "avc" in vcodec
+            h = f["height"]
+            fps = f.get("fps") or 0
+            if best is None:
+                best = (is_h264, h, fps, f)
+                continue
+            prev_h264, prev_h, prev_fps, _ = best
+            if (is_h264, h, fps) > (prev_h264, prev_h, fps):
+                best = (is_h264, h, fps, f)
+    return best[-1] if best else None
 
 
 # ============================================================================
@@ -331,8 +481,8 @@ class DownloadModal(QDialog):
             if entries:
                 self.display = entries[0]
         self.save_dir = save_dir
-        self.selected_opts = None
-        self.selected_kind = "video"
+        self.selected_opts_list = []   # list of (opts_dict, kind_str)
+        self.fmt_checkboxes = []       # QCheckBox instances
 
         self.setWindowTitle("Download")
         self.setMinimumSize(640, 620)
@@ -398,12 +548,12 @@ class DownloadModal(QDialog):
             grid.addWidget(combo, 1, col)
 
         self.type_combo.currentTextChanged.connect(self._repopulate_formats)
+        self.container_combo.currentIndexChanged.connect(self._repopulate_formats)
         self.codec_combo.currentTextChanged.connect(self._repopulate_formats)
         self.fps_combo.currentTextChanged.connect(self._repopulate_formats)
         root.addLayout(grid)
 
-        # --- Format radio list ---
-        self.fmt_group = QButtonGroup(self)
+        # --- Format checkbox list ---
         self.fmt_scroll = QScrollArea()
         self.fmt_scroll.setWidgetResizable(True)
         self.fmt_container = QWidget()
@@ -428,9 +578,9 @@ class DownloadModal(QDialog):
 
     # -- format list -------------------------------------------------------
     def _clear_formats(self):
-        for btn in self.fmt_group.buttons():
-            self.fmt_group.removeButton(btn)
-            btn.deleteLater()
+        for cb in self.fmt_checkboxes:
+            cb.deleteLater()
+        self.fmt_checkboxes.clear()
         while self.fmt_layout.count() > 1:
             item = self.fmt_layout.takeAt(0)
             if item.widget():
@@ -449,9 +599,14 @@ class DownloadModal(QDialog):
         self._clear_formats()
         formats = self.display.get("formats") or []
         is_audio = self.type_combo.currentText() == "Audio"
+        container = self.container_combo.currentText()
         codec_filter = self.codec_combo.currentText()
         fps_filter = self.fps_combo.currentText()
         audio_size = self._best_audio_size()
+
+        # Container → extension filter
+        _CONTAINER_EXT = {"MP4": "mp4", "MKV": "mkv", "MP3": "mp3"}
+        target_ext = _CONTAINER_EXT.get(container)
 
         rows = []
         if is_audio:
@@ -459,6 +614,14 @@ class DownloadModal(QDialog):
                 if f.get("acodec") in (None, "none") or \
                    f.get("vcodec") not in (None, "none"):
                     continue
+                if target_ext:
+                    fmt_ext = (f.get("ext") or "").lower()
+                    if target_ext == "mp3" and fmt_ext not in ("mp3", "m4a"):
+                        continue
+                    elif target_ext == "mkv" and fmt_ext not in ("mkv", "webm"):
+                        continue
+                    elif target_ext == "mp4" and fmt_ext not in ("mp4", "m4a"):
+                        continue
                 abr = f.get("abr") or 0
                 size = f.get("filesize") or f.get("filesize_approx")
                 label = (f"{abr:.0f} kbps    {(f.get('ext') or '?').upper()}"
@@ -476,6 +639,12 @@ class DownloadModal(QDialog):
                 vcodec = (f.get("vcodec") or "").lower()
                 if codec_prefix and not vcodec.startswith(codec_prefix):
                     continue
+                if target_ext:
+                    fmt_ext = (f.get("ext") or "").lower()
+                    if target_ext == "mp4" and fmt_ext not in ("mp4", "m4a"):
+                        continue
+                    elif target_ext == "mkv" and fmt_ext not in ("mkv", "webm"):
+                        continue
                 fps = f.get("fps") or 0
                 if fps_filter == "60fps" and fps < 50:
                     continue
@@ -496,66 +665,88 @@ class DownloadModal(QDialog):
                 rows.append((h * 1000 + fps, label, f))
             rows.sort(key=lambda r: -r[0])
 
-        for i, (_, label, f) in enumerate(rows[:24]):
-            rb = QRadioButton(label)
-            rb.setStyleSheet("font-family: Consolas, monospace;")
-            rb.setProperty("fmt", f)
-            self.fmt_group.addButton(rb)
-            self.fmt_layout.insertWidget(self.fmt_layout.count() - 1, rb)
-            if i == 0:
-                rb.setChecked(True)
+        # Recommendation engine — pass filtered rows, not raw formats
+        rec_fmts = [row[2] for row in rows]
+        recommended = _recommend_format(rec_fmts, is_audio=is_audio)
+
+        for _, label, f in rows[:24]:
+            is_rec = (recommended is not None
+                      and f.get("format_id") == recommended.get("format_id"))
+            display_label = f"  {label}  (⭐ Recommended)" if is_rec else label
+            cb = QCheckBox(display_label)
+            cb.setStyleSheet("font-family: Consolas, monospace;")
+            cb.setProperty("fmt", f)
+            if is_rec:
+                cb.setChecked(True)
+                cb.setStyleSheet(
+                    "font-family: Consolas, monospace;"
+                    " color: #3fb950; font-weight: bold;")
+            self.fmt_checkboxes.append(cb)
+            self.fmt_layout.insertWidget(self.fmt_layout.count() - 1, cb)
 
     # -- accept ------------------------------------------------------------
     def _accept_download(self):
-        checked = self.fmt_group.checkedButton()
-        fmt = checked.property("fmt") if checked else None
+        checked = [cb for cb in self.fmt_checkboxes if cb.isChecked()]
+        if not checked:
+            return
+
         is_audio = self.type_combo.currentText() == "Audio"
         container = self.container_combo.currentText()
         subs = self.subs_combo.currentText()
         is_playlist = self.info.get("_type") == "playlist"
 
-        outtmpl = os.path.join(self.save_dir, "%(title)s.%(ext)s")
-        if is_playlist:
-            outtmpl = os.path.join(
-                self.save_dir, "%(playlist_title)s",
-                "%(playlist_index)s - %(title)s.%(ext)s")
+        self.selected_opts_list = []
+        for cb in checked:
+            fmt = cb.property("fmt")
+            outtmpl = os.path.join(self.save_dir, "%(title)s.%(ext)s")
+            if is_playlist:
+                outtmpl = os.path.join(
+                    self.save_dir, "%(playlist_title)s",
+                    "%(playlist_index)s - %(title)s.%(ext)s")
 
-        opts = {
-            "outtmpl": outtmpl,
-            "ffmpeg_location": FFMPEG_DIR,
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": not is_playlist,
-            "ignoreerrors": is_playlist,
-        }
+            fmt_id = fmt.get("format_id", "best") if fmt else "best"
+            height = fmt.get("height")
+            suffix = f"_[{height}p]" if height else f"_[{fmt_id}]"
+            base, ext = os.path.splitext(outtmpl)
+            outtmpl_unique = f"{base}{suffix}{ext}"
 
-        if is_audio:
-            opts["format"] = (f"{fmt['format_id']}/bestaudio/best"
-                              if fmt else "bestaudio/best")
-            codec = "mp3" if container in ("Auto", "MP3") else container.lower()
-            opts["postprocessors"] = [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": codec if codec in ("mp3",) else "mp3",
-                "preferredquality": "192",
-            }]
-            self.selected_kind = "audio"
-        else:
-            if fmt:
-                opts["format"] = f"{fmt['format_id']}+bestaudio/best"
+            opts = {
+                "outtmpl": outtmpl_unique,
+                "ffmpeg_location": FFMPEG_DIR,
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": not is_playlist,
+                "ignoreerrors": is_playlist,
+                "format_sort": ["vcodec:h264", "acodec:m4a", "res", "fps"],
+                "concurrent_fragment_downloads": 10,
+            }
+
+            if is_audio:
+                opts["format"] = (f"{fmt_id}/bestaudio/best"
+                                  if fmt else "bestaudio/best")
+                codec = ("mp3" if container in ("Auto", "MP3")
+                         else container.lower())
+                opts["postprocessors"] = [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": codec if codec in ("mp3",) else "mp3",
+                    "preferredquality": "192",
+                }]
+                kind = "audio"
             else:
-                opts["format"] = "bestvideo+bestaudio/best"
-            merge = {"MP4": "mp4", "MKV": "mkv"}.get(container, "mp4")
-            opts["merge_output_format"] = merge
-            self.selected_kind = "playlist" if is_playlist else "video"
+                opts["format"] = f"{fmt_id}+bestaudio/best"
+                merge = {"MP4": "mp4", "MKV": "mkv"}.get(container, "mp4")
+                opts["merge_output_format"] = merge
+                kind = "playlist" if is_playlist else "video"
 
-            if subs != "None":
-                opts["writesubtitles"] = True
-                if subs == "Auto-generated":
-                    opts["writeautomaticsub"] = True
-                opts["subtitleslangs"] = ["en"]
-                opts["postprocessors"] = [{"key": "FFmpegEmbedSubtitle"}]
+                if subs != "None":
+                    opts["writesubtitles"] = True
+                    if subs == "Auto-generated":
+                        opts["writeautomaticsub"] = True
+                    opts["subtitleslangs"] = ["en"]
+                    opts["postprocessors"] = [
+                        {"key": "FFmpegEmbedSubtitle"}]
 
-        self.selected_opts = opts
+            self.selected_opts_list.append((opts, kind))
         self.accept()
 
 
@@ -570,6 +761,7 @@ class DownloadItem(QFrame):
         self.setObjectName("card")
         self.kind = kind
         self.worker = worker
+        self.file_path = ""
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(12, 10, 12, 10)
@@ -606,7 +798,7 @@ class DownloadItem(QFrame):
         mid.addWidget(self.stat_label)
         lay.addLayout(mid, 1)
 
-        btns = QVBoxLayout()
+        self.btns_layout = QVBoxLayout()
         self.pause_btn = QPushButton("Pause")
         self.pause_btn.setFixedWidth(90)
         self.pause_btn.clicked.connect(self.toggle_pause)
@@ -614,9 +806,9 @@ class DownloadItem(QFrame):
         self.cancel_btn.setObjectName("danger")
         self.cancel_btn.setFixedWidth(90)
         self.cancel_btn.clicked.connect(self.cancel)
-        btns.addWidget(self.pause_btn)
-        btns.addWidget(self.cancel_btn)
-        lay.addLayout(btns)
+        self.btns_layout.addWidget(self.pause_btn)
+        self.btns_layout.addWidget(self.cancel_btn)
+        lay.addLayout(self.btns_layout)
 
         worker.progress.connect(self.on_progress)
         worker.done.connect(self.on_done)
@@ -652,17 +844,84 @@ class DownloadItem(QFrame):
             parts.append(f"ETA {eta}s")
         self.stat_label.setText("  ·  ".join(parts))
 
-    def on_done(self, ok: bool, msg: str):
-        self.pause_btn.setEnabled(False)
-        self.cancel_btn.setEnabled(False)
+    def on_done(self, ok: bool, msg: str, file_path: str):
+        self.file_path = file_path
+
         if ok:
             self.bar.setValue(1000)
             self.stat_label.setText("✅ " + msg)
             self.stat_label.setStyleSheet(
                 "color: #3fb950; font-size: 11px; font-weight: bold;")
+            self._swap_buttons_success()
         else:
+            self.pause_btn.setEnabled(False)
+            self.cancel_btn.setEnabled(False)
             self.stat_label.setText("❌ " + msg)
             self.stat_label.setStyleSheet("color: #ff5555; font-size: 11px;")
+
+    def _swap_buttons_success(self):
+        self.pause_btn.hide()
+        self.cancel_btn.hide()
+
+        self.show_btn = QPushButton("  Show File")
+        self.show_btn.setIcon(qta.icon("fa5s.folder-open", color="#e6edf3"))
+        self.show_btn.setFixedWidth(110)
+        self.show_btn.setStyleSheet(
+            "background-color: #30363d; border: none; color: #e6edf3;"
+            "border-radius: 6px; padding: 6px 10px;")
+        self.show_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.show_btn.clicked.connect(self.show_file)
+        self.btns_layout.addWidget(self.show_btn)
+
+        self.delete_btn = QPushButton("  Delete")
+        self.delete_btn.setIcon(qta.icon("fa5s.trash", color="#ffffff"))
+        self.delete_btn.setFixedWidth(110)
+        self.delete_btn.setObjectName("danger")
+        self.delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.delete_btn.clicked.connect(self.delete_file)
+        self.btns_layout.addWidget(self.delete_btn)
+
+    def show_file(self):
+        if not self.file_path or not os.path.isfile(self.file_path):
+            self.stat_label.setText("File not found on disk.")
+            self.stat_label.setStyleSheet("color: #ff5555; font-size: 11px;")
+            return
+        if sys.platform == "win32":
+            subprocess.Popen(rf'explorer /select,"{self.file_path}"')
+        else:
+            dir_path = os.path.dirname(self.file_path)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(dir_path))
+
+    def delete_file(self):
+        if not self.file_path:
+            self._remove_from_list()
+            return
+        reply = QMessageBox.question(
+            self, "Delete File",
+            f"Are you sure you want to delete this file?\n\n{self.file_path}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                if os.path.isfile(self.file_path):
+                    os.remove(self.file_path)
+            except OSError as e:
+                self.stat_label.setText(f"❌ Delete failed: {e}")
+                self.stat_label.setStyleSheet(
+                    "color: #ff5555; font-size: 11px;")
+                return
+            self._remove_from_list()
+
+    def _remove_from_list(self):
+        parent = self.parent()
+        if parent:
+            lay = parent.layout()
+            if lay:
+                lay.removeWidget(self)
+        self.worker.is_cancelled = True
+        self.worker.is_paused = False
+        self.deleteLater()
 
 
 # ============================================================================
@@ -922,7 +1181,7 @@ class MainWindow(QMainWindow):
         h = QHBoxLayout()
         h.setSpacing(14)
 
-        self.smart_toggle = QCheckBox("Smart Mode")
+        self.smart_toggle = ToggleSwitch("Smart Mode")
         self.smart_toggle.setToolTip(
             "Skip the dialog — download instantly with the presets below")
         h.addWidget(self.smart_toggle)
@@ -1120,9 +1379,9 @@ class MainWindow(QMainWindow):
             return
 
         modal = DownloadModal(self, info, thumb, self.save_dir)
-        if modal.exec() == QDialog.DialogCode.Accepted and modal.selected_opts:
-            self.start_download(
-                url, modal.selected_opts, info, modal.selected_kind, thumb)
+        if modal.exec() == QDialog.DialogCode.Accepted and modal.selected_opts_list:
+            for opts, kind in modal.selected_opts_list:
+                self.start_download(url, opts, info, kind, thumb)
 
     # ------------------------------------------------------------------
     # Smart mode opts from global presets
@@ -1146,6 +1405,8 @@ class MainWindow(QMainWindow):
             "no_warnings": True,
             "noplaylist": not is_playlist,
             "ignoreerrors": is_playlist,
+            "format_sort": ["vcodec:h264", "acodec:m4a", "res", "fps"],
+            "concurrent_fragment_downloads": 10,
         }
 
         if is_audio:

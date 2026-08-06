@@ -29,7 +29,6 @@ dependencies = [
     "yt-dlp>=2025.1.1",
     "requests>=2.31.0",
     "Pillow>=10.0.0",
-    "customtkinter>=5.2.2",
 ]
 
 [project.optional-dependencies]
@@ -37,7 +36,6 @@ dev = ["pytest>=8.0"]
 
 [project.scripts]
 universal-downloader = "universal_downloader.qt_app:main"
-universal-downloader-tk = "universal_downloader.app:main"
 
 [project.urls]
 Homepage = "https://github.com/your-user/universal-downloader-plus"

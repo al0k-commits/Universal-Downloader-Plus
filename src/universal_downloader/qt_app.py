@@ -516,6 +516,24 @@ def _recommend_format(formats: list, is_audio: bool = False) -> dict | None:
     return best[-1] if best else None
 
 
+def get_best_format(info, media_type: str = "video") -> dict | None:
+    """Headless best-format recommendation (Smart Mode / external callers).
+
+    Accepts either a yt-dlp info dict (handles playlist unwrapping) or a
+    bare list of formats. Returns the winning format dict or None.
+    """
+    if isinstance(info, dict):
+        display = info
+        if info.get("_type") == "playlist" and info.get("entries"):
+            entries = [e for e in info["entries"] if e]
+            if entries:
+                display = entries[0]
+        formats = display.get("formats") or []
+    else:
+        formats = list(info or [])
+    return _recommend_format(formats, is_audio=(media_type == "audio"))
+
+
 # ============================================================================
 # Download modal dialog
 # ============================================================================
@@ -716,7 +734,7 @@ class DownloadModal(QDialog):
 
         # Recommendation engine — pass filtered rows, not raw formats
         rec_fmts = [row[2] for row in rows]
-        recommended = _recommend_format(rec_fmts, is_audio=is_audio)
+        recommended = get_best_format(rec_fmts, "audio" if is_audio else "video")
 
         for _, label, f in rows[:24]:
             is_rec = (recommended is not None
@@ -992,6 +1010,18 @@ class DownloadItem(QFrame):
         self.delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.delete_btn.clicked.connect(self.delete_file)
         self.btns_layout.addWidget(self.delete_btn)
+
+        self.clear_btn = QPushButton("  Clear")
+        self.clear_btn.setIcon(qta.icon("fa5s.eraser", color="#9aa4b2"))
+        self.clear_btn.setFixedWidth(110)
+        self.clear_btn.setStyleSheet(
+            "background-color: #3d444d; border: none; color: #e6edf3;"
+            "border-radius: 6px; padding: 6px 10px;")
+        self.clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.clear_btn.setToolTip(
+            "Remove from the list (keeps the file on disk)")
+        self.clear_btn.clicked.connect(self.deleteLater)
+        self.btns_layout.addWidget(self.clear_btn)
 
     def show_file(self):
         if not self.file_path or not os.path.isfile(self.file_path):
@@ -1486,8 +1516,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Ready.")
 
         if self.smart_toggle.isChecked():
-            opts, kind = self.build_smart_opts(info)
-            self.start_download(url, opts, info, kind, thumb)
+            self.smart_download_headless(url, info, thumb)
             return
 
         modal = DownloadModal(self, info, thumb, self.save_dir)
@@ -1496,9 +1525,29 @@ class MainWindow(QMainWindow):
                 self.start_download(url, opts, info, kind, thumb)
 
     # ------------------------------------------------------------------
+    # Smart Mode (headless) — no dialog
+    # ------------------------------------------------------------------
+    def smart_download_headless(self, url: str, info: dict, thumb: bytes):
+        """Bypass the modal: pick the best format with the current presets and
+        enqueue it straight to a DownloadWorker. Errors surface in a dialog
+        instead of crashing the app."""
+        try:
+            media_type = ("audio"
+                          if self.preset_format.currentText() == "Audio"
+                          else "video")
+            best = get_best_format(info, media_type)
+            opts, kind = self.build_smart_opts(info, best)
+            self.start_download(url, opts, info, kind, thumb)
+        except Exception as e:
+            print(f"Smart Mode failed: {e}")
+            QMessageBox.critical(
+                self, "Smart Mode",
+                f"Automatic download failed:\n{e}")
+
+    # ------------------------------------------------------------------
     # Smart mode opts from global presets
     # ------------------------------------------------------------------
-    def build_smart_opts(self, info: dict):
+    def build_smart_opts(self, info: dict, best: dict | None = None):
         is_playlist = info.get("_type") == "playlist"
         is_audio = self.preset_format.currentText() == "Audio"
         quality = self.preset_quality.currentText()
@@ -1521,8 +1570,12 @@ class MainWindow(QMainWindow):
             "concurrent_fragment_downloads": 10,
         }
 
+        # Use the headless recommendation when available (Smart Mode).
+        best_id = (best or {}).get("format_id")
+
         if is_audio:
-            opts["format"] = "bestaudio/best"
+            opts["format"] = (f"{best_id}/bestaudio/best"
+                              if best_id else "bestaudio/best")
             opts["postprocessors"] = [{
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "mp3",
@@ -1531,7 +1584,9 @@ class MainWindow(QMainWindow):
             return opts, "audio"
 
         if quality == "Best":
-            opts["format"] = "bestvideo+bestaudio/best"
+            opts["format"] = ("bestvideo+bestaudio/best"
+                              if not best_id else
+                              f"{best_id}+bestaudio/best")
         else:
             h = quality.rstrip("p")
             opts["format"] = (f"bestvideo[height<={h}]+bestaudio"

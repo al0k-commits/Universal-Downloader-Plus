@@ -21,7 +21,7 @@ import yt_dlp
 import qtawesome as qta
 import qdarktheme
 
-from PyQt6.QtCore import Qt, QUrl, QThread, pyqtSignal, QSize, QPropertyAnimation, QEasingCurve, pyqtProperty
+from PyQt6.QtCore import Qt, QUrl, QThread, pyqtSignal, QSize, QPropertyAnimation, QEasingCurve, pyqtProperty, QTimer
 from PyQt6.QtGui import QPixmap, QClipboard, QIcon, QPainter, QColor, QBrush, QPen, QDesktopServices
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QDialog, QLabel, QPushButton,
@@ -340,6 +340,7 @@ class AdBlockInterceptor(QWebEngineUrlRequestInterceptor):
 class AnalyzeWorker(QThread):
     """Fetch metadata + thumbnail bytes off the UI thread."""
     result = pyqtSignal(dict, bytes)
+    playlist = pyqtSignal(dict, bytes)
     error = pyqtSignal(str)
 
     def __init__(self, url: str):
@@ -352,8 +353,12 @@ class AnalyzeWorker(QThread):
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(self.url, download=False)
 
+            is_playlist = (
+                info.get("_type") == "playlist"
+                and info.get("entries"))
+
             display = info
-            if info.get("_type") == "playlist" and info.get("entries"):
+            if is_playlist:
                 entries = [e for e in info["entries"] if e]
                 if entries:
                     display = entries[0]
@@ -368,7 +373,11 @@ class AnalyzeWorker(QThread):
                 except Exception:
                     thumb = b""
 
-            self.result.emit(info, thumb)
+            if is_playlist:
+                # Pause the standard flow - let the Main Window decide.
+                self.playlist.emit(info, thumb)
+            else:
+                self.result.emit(info, thumb)
         except yt_dlp.utils.DownloadError as e:
             self.error.emit(str(e).replace("ERROR:", "").strip())
         except Exception as e:
@@ -457,6 +466,15 @@ class DownloadWorker(QThread):
                     pass
 
             opts = self.ydl_opts
+            # Embed thumbnail + metadata (ID3 tags for audio) into the final
+            # file. Reusing whatever postprocessors the caller built (e.g.
+            # FFmpegExtractAudio for MP3) and appending the embedders at the
+            # end of the chain.
+            opts["writethumbnail"] = True
+            pps = list(opts.get("postprocessors") or [])
+            pps.append({"key": "EmbedThumbnail"})
+            pps.append({"key": "FFmpegMetadata", "add_metadata": True})
+            opts["postprocessors"] = pps
             opts["progress_hooks"] = [self._hook]
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info_dict = ydl.extract_info(self.url, download=True)
@@ -1502,6 +1520,8 @@ class MainWindow(QMainWindow):
         self.analyze_worker = AnalyzeWorker(url)
         self.analyze_worker.result.connect(
             lambda info, thumb, u=url: self.on_analyzed(u, info, thumb))
+        self.analyze_worker.playlist.connect(
+            lambda info, thumb, u=url: self.on_playlist_found(u, info, thumb))
         self.analyze_worker.error.connect(self.on_analyze_error)
         self.analyze_worker.start()
 
@@ -1523,6 +1543,140 @@ class MainWindow(QMainWindow):
         if modal.exec() == QDialog.DialogCode.Accepted and modal.selected_opts_list:
             for opts, kind in modal.selected_opts_list:
                 self.start_download(url, opts, info, kind, thumb)
+
+    # ------------------------------------------------------------------
+    # Playlist handling
+    # ------------------------------------------------------------------
+    def on_playlist_found(self, url: str, info: dict, thumb: bytes):
+        self.paste_btn.setEnabled(True)
+        self.go_btn.setEnabled(True)
+        self.statusBar().showMessage("Ready.")
+
+        if self.smart_toggle.isChecked():
+            # Smart Mode treats everything headlessly - just grab the first
+            # video (or use playlist form). Keep it simple: download whole list.
+            self.smart_download_headless(url, info, thumb)
+            return
+
+        entries = [e for e in info.get("entries") or [] if e]
+        count = len(entries)
+        if not count:
+            self.statusBar().showMessage("Playlist has no playable videos.")
+            return
+
+        choice = self._ask_playlist(count)
+        if choice == "all":
+            self._download_playlist_all(url, info, entries, thumb)
+        elif choice == "single":
+            self._download_playlist_single(url, info, entries[0], thumb)
+        # else: cancelled, do nothing
+
+    def _ask_playlist(self, count: int):
+        """Dark-themed QDialog offering playlist vs. single-video download."""
+        box = QDialog(self)
+        box.setWindowTitle("Playlist detected")
+        box.setMinimumWidth(420)
+
+        lay = QVBoxLayout(box)
+        lay.setSpacing(14)
+
+        msg = QLabel(
+            f"This link contains a playlist with <b>{count}</b> videos.\n"
+            "What would you like to do?")
+        msg.setWordWrap(True)
+        msg.setStyleSheet("font-size: 14px;")
+        lay.addWidget(msg)
+
+        btn_all = QPushButton("Download Entire Playlist")
+        btn_all.setObjectName("green")
+        btn_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_all.clicked.connect(lambda: box.done(1))
+        lay.addWidget(btn_all)
+
+        btn_one = QPushButton("Download Single Video")
+        btn_one.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_one.clicked.connect(lambda: box.done(2))
+        lay.addWidget(btn_one)
+
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setObjectName("danger")
+        btn_cancel.clicked.connect(box.reject)
+        lay.addWidget(btn_cancel)
+
+        result = box.exec()
+        if result == 1:
+            return "all"
+        if result == 2:
+            return "single"
+        return "cancel"
+
+    def _download_playlist_single(self, url: str, info: dict, first, thumb: bytes):
+        """Download only the first entry via the normal modal flow."""
+        single_url = (first.get("webpage_url")
+                      or first.get("url")
+                      or url)
+        modal = DownloadModal(self, first, thumb, self.save_dir)
+        if modal.exec() == QDialog.DialogCode.Accepted and modal.selected_opts_list:
+            for opts, kind in modal.selected_opts_list:
+                self.start_download(single_url, opts, first, kind, thumb)
+
+    def _download_playlist_all(self, url: str, info: dict, entries: list,
+                               thumb: bytes):
+        """Headless batch: best format, one worker per video, limited
+        concurrency to avoid rate-limiting."""
+        media_type = ("audio"
+                      if self.preset_format.currentText() == "Audio"
+                      else "video")
+        best = get_best_format(info, media_type)
+        playlist_title = info.get("title") or "Playlist"
+        total = len(entries)
+
+        # Build a playlist-scoped opt template once, then clone per entry.
+        opts, kind = self.build_smart_opts(info, best)
+        # Each batch worker downloads a single video, so drop the playlist
+        # context: fallback title keeps the folder name sane.
+        outtmpl = os.path.join(
+            self.save_dir, "%(playlist_title|Playlist)s",
+            "%(title)s.%(ext)s")
+        opts["outtmpl"] = outtmpl
+        opts["noplaylist"] = True
+
+        for i, entry in enumerate(entries[: self.PLAYLIST_MAX]):
+            entry_url = (entry.get("webpage_url")
+                         or entry.get("url")
+                         or url)
+            per_entry = dict(opts)
+            QTimer.singleShot(  # stagger starts to dodge rate limiting
+                i * self.PLAYLIST_STAGGER_MS,
+                lambda u=entry_url, o=per_entry, e=entry: (
+                    self._start_playlist_entry(u, o, e, playlist_title, total)))
+
+    def _start_playlist_entry(self, url, opts, entry, playlist_title, total):
+        """Spawn one DownloadWorker + UI row for a single playlist entry."""
+        title = entry.get("title") or "Unknown"
+        display_title = f"[{playlist_title} · {total}] {title}"
+
+        meta_parts = [human_duration(entry.get("duration"))]
+        if entry.get("height"):
+            meta_parts.append(f"{entry['height']}p")
+        if entry.get("ext"):
+            meta_parts.append(entry["ext"].upper())
+        uploader = entry.get("uploader") or entry.get("channel")
+        if uploader:
+            meta_parts.append(uploader)
+        meta = "  ·  ".join(str(p) for p in meta_parts if p and p != "?")
+
+        worker = DownloadWorker(
+            url, opts, thumb_url=entry.get("thumbnail") or "")
+        item = DownloadItem(display_title, meta, b"", "playlist", worker)
+        self.downloads_page.add_item(item)
+        self.workers.append(worker)
+        worker.done.connect(lambda *_: self.update_active_count())
+        worker.start()
+        self.update_active_count()
+
+    PLAYLIST_STAGGER_MS = 350   # per-video start delay (rate-limit guard)
+    PLAYLIST_MAX = 999
 
     # ------------------------------------------------------------------
     # Smart Mode (headless) — no dialog

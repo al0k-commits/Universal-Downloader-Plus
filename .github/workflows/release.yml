@@ -1,0 +1,215 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: UniversalDownloader-windows-x64.zip
+            exe_name: UniversalDownloader.exe
+            ffmpeg_dir: ffmpeg
+          - os: ubuntu-latest
+            artifact: UniversalDownloader-linux-x64.zip
+            exe_name: UniversalDownloader
+            ffmpeg_dir: ffmpeg
+          - os: macos-latest
+            artifact: UniversalDownloader-macos-universal.zip
+            exe_name: UniversalDownloader
+            ffmpeg_dir: ffmpeg
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pyinstaller
+
+      # ------------------------------------------------------------------
+      # OS-specific FFmpeg binaries -> ./ffmpeg at the repository root so
+      # PyInstaller can bundle them and the app's FFMPEG_DIR check passes.
+      # ------------------------------------------------------------------
+      - name: Fetch FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          curl.exe -fsSL -o ffmpeg.zip https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
+          unzip -qo ffmpeg.zip
+          mkdir -p ffmpeg
+          cp ffmpeg-*/bin/ffmpeg.exe ffmpeg-*/bin/ffprobe.exe ffmpeg/
+          rm -rf ffmpeg-* ffmpeg.zip
+          ls -la ffmpeg/
+
+      - name: Fetch FFmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          curl -fsSL -o ffmpeg-static.tar.xz \
+            https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
+          tar -xJf ffmpeg-static.tar.xz
+          mkdir -p ffmpeg
+          cp ffmpeg-*/ffmpeg ffmpeg-*/ffprobe ffmpeg/
+          chmod +x ffmpeg/ffmpeg ffmpeg/ffprobe
+          rm -rf ffmpeg-* ffmpeg-static.tar.xz
+          ls -la ffmpeg/
+
+      - name: Fetch FFmpeg (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          # macos-latest runners are arm64; the commonly-fetched build hosts
+          # (evermeet.cx etc.) ship x86_64 only, so use the runner's own
+          # package manager for a natively-executable universal build..
+          brew install ffmpeg
+          mkdir -p ffmpeg
+          cp "$(brew --prefix ffmpeg)/bin/ffmpeg" ffmpeg/ffmpeg
+          cp "$(brew --prefix ffmpeg)/bin/ffprobe" ffmpeg/ffprobe
+          ls -la ffmpeg/
+
+      # ------------------------------------------------------------------
+      # PyInstaller. Separator: ; on Windows, : on Unix.
+      # ------------------------------------------------------------------
+      - name: Build with PyInstaller (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed \
+            --name UniversalDownloader \
+            --icon src/universal_downloader/resources/icon.ico \
+            --add-data "src/universal_downloader/resources;resources" \
+            --add-data "ffmpeg;ffmpeg" \
+            --collect-all PyQt6.QtWebEngineWidgets \
+            --collect-all PyQt6.QtWebEngineCore \
+            src/universal_downloader/__main__.py
+
+      - name: Build with PyInstaller (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed \
+            --name UniversalDownloader \
+            --icon src/universal_downloader/resources/icon-512x512.png \
+            --add-data "src/universal_downloader/resources:resources" \
+            --add-data "ffmpeg:ffmpeg" \
+            --collect-all PyQt6.QtWebEngineWidgets \
+            --collect-all PyQt6.QtWebEngineCore \
+            src/universal_downloader/__main__.py
+
+      - name: Build with PyInstaller (macOS)
+        if: runner.os == 'macOS'
+        env:
+          codesign_identity: "-"
+        run: |
+          # Onefile is not supported on macOS - the .app bundle layout is used
+          # regardless. codesign_identity "-" performs an ad-hoc signature that
+          # PyInstaller will then hand to codesign (see signing step).
+          python -m PyInstaller --noconfirm --clean --windowed \
+            --name UniversalDownloader \
+            --icon src/universal_downloader/resources/icon.icns \
+            --add-data "src/universal_downloader/resources:resources" \
+            --add-data "ffmpeg:ffmpeg" \
+            --collect-all PyQt6.QtWebEngineWidgets \
+            --collect-all PyQt6.QtWebEngineCore \
+            src/universal_downloader/__main__.py
+
+      # ------------------------------------------------------------------
+      # Place FFmpeg next to the executable so FFMPEG_DIR (=exe dir) resolves.
+      # ------------------------------------------------------------------
+      - name: Stage FFmpeg beside binary (Windows/Linux)
+        if: runner.os != 'macOS'
+        run: |
+          mkdir -p dist/ffmpeg
+          cp ffmpeg/* dist/ffmpeg/
+          ls -la dist/
+
+      - name: Stage FFmpeg inside .app (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cp -r ffmpeg dist/UniversalDownloader.app/Contents/MacOS/ffmpeg
+          ls -la dist/UniversalDownloader.app/Contents/MacOS/
+
+      # ------------------------------------------------------------------
+      # Self-signing / ad-hoc signing, branded "Alok".
+      # ------------------------------------------------------------------
+      - name: Sign Windows EXE (self-signed "Alok")
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $cert = New-SelfSignedCertificate -DnsName "Alok" `
+            -Subject "CN=Alok" `
+            -CertStoreLocation "cert:\CurrentUser\My" `
+            -Type CodeSigningCert `
+            -KeyUsage DigitalSignature `
+            -KeyUsageProperty All
+          Write-Host "Cert thumbprint: $($cert.Thumbprint)"
+
+          # Windows SDK signtool if present, else PowerShell fallback.
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" `
+            -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1
+
+          if ($signtool) {
+            & $signtool.FullName sign /sha1 $cert.Thumbprint /n "Alok" /fd SHA256 `
+              /tr http://timestamp.digicert.com /td SHA256 `
+              dist\UniversalDownloader.exe
+          } else {
+            $sig = Set-AuthenticodeSignature `
+              -FilePath "dist\UniversalDownloader.exe" `
+              -Certificate $cert `
+              -HashAlgorithm SHA256 `
+              -TimestampServer "http://timestamp.digicert.com"
+            $sig.Status
+          }
+          Get-AuthenticodeSignature "dist\UniversalDownloader.exe" |
+            Select-Object Status, SignerCertificate
+
+      - name: Ad-hoc sign macOS .app ("Alok")
+        if: runner.os == 'macOS'
+        run: |
+          # --force reapplies; --deep covers nested Qt frameworks/binaries.
+          codesign --force --deep --sign - "dist/UniversalDownloader.app"
+          codesign --verify --verbose "dist/UniversalDownloader.app"
+          echo "signed by: $(codesign -dv --verbose=4 dist/UniversalDownloader.app 2>&1 | grep -i 'Signer identity')"
+
+      - name: Verify Linux binary is actually present
+        if: runner.os == 'Linux'
+        run: file dist/UniversalDownloader
+
+      # ------------------------------------------------------------------
+      # Zip the dist/ output for the release.
+      # ------------------------------------------------------------------
+      - name: Zip artifacts
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          python -c "import shutil; shutil.make_archive('artifacts/${{ matrix.artifact }}'.replace('.zip',''), 'zip', 'dist')"
+          ls -la artifacts/
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            artifacts/${{ matrix.artifact }}

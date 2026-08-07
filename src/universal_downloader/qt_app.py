@@ -14,6 +14,7 @@ import sys
 import time
 import ctypes
 import subprocess
+import threading
 
 import requests
 import yt_dlp
@@ -95,6 +96,9 @@ def safe_icon(name: str, color: str):
         return qta.icon(name, color=color)
     except Exception:
         return qta.icon("fa5s.globe", color=color)
+
+# yt-dlp decorates status strings with ANSI color codes (e.g. "\x1b[0;94m").
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 VIDEO_URL_RE = re.compile(
     r"(youtube\.com/(watch|shorts|playlist)|youtu\.be/"
@@ -374,22 +378,53 @@ class AnalyzeWorker(QThread):
 class DownloadWorker(QThread):
     """Runs yt-dlp; pause via flag loop, cancel via exception in hook."""
     progress = pyqtSignal(dict)
+    progress_update = pyqtSignal(float, str)   # percent (0.0-100.0), speed str
+    thumbnail_ready = pyqtSignal(bytes)
     done = pyqtSignal(bool, str, str)   # ok, message, file_path
 
-    def __init__(self, url: str, ydl_opts: dict):
+    def __init__(self, url: str, ydl_opts: dict, thumb_url: str = ""):
         super().__init__()
         self.url = url
         self.ydl_opts = dict(ydl_opts)
+        self.thumb_url = thumb_url
         self.is_paused = False
-        self.is_cancelled = False
+        self._is_canceled = False
+        self._cancel_lock = threading.Lock()
+
+    @property
+    def is_cancelled(self) -> bool:
+        with self._cancel_lock:
+            return self._is_canceled
+
+    @is_cancelled.setter
+    def is_cancelled(self, value: bool):
+        with self._cancel_lock:
+            self._is_canceled = bool(value)
+
+    @staticmethod
+    def _parse_percent(s) -> float:
+        """' 12.3%' / '\\x1b[0;94m 12.3%\\x1b[0m' -> 12.3"""
+        if isinstance(s, (int, float)):
+            return float(s)
+        match = re.search(r"\d+(?:\.\d+)?", ANSI_RE.sub("", str(s or "")))
+        return float(match.group()) if match else 0.0
+
+    @staticmethod
+    def _format_speed(d: dict) -> str:
+        """Format yt-dlp speed string (' 3.5MiB/s') into '3.5 MB/s'."""
+        raw = ANSI_RE.sub("", str(d.get("_speed_str") or "")).strip()
+        if not raw:
+            return ""
+        return (raw.replace("KiB", "KB").replace("MiB", "MB")
+                .replace("GiB", "GB").strip())
 
     def _hook(self, d: dict):
         if self.is_cancelled:
-            raise DownloadCancelled("Download cancelled by user")
+            raise yt_dlp.utils.DownloadError("Canceled by user")
         while self.is_paused:
             time.sleep(0.4)
             if self.is_cancelled:
-                raise DownloadCancelled("Download cancelled by user")
+                raise yt_dlp.utils.DownloadError("Canceled by user")
 
         status = d.get("status")
         if status == "downloading":
@@ -402,11 +437,25 @@ class DownloadWorker(QThread):
                 "downloaded": downloaded,
                 "total": total,
             })
+            self.progress_update.emit(
+                self._parse_percent(d.get("_percent_str")),
+                self._format_speed(d),
+            )
         elif status == "finished":
             self.progress.emit({"fraction": 1.0, "processing": True})
 
     def run(self):
         try:
+            # Fetch thumbnail bytes in this worker thread so the GUI event loop
+            # never blocks on the network request.
+            if self.thumb_url:
+                try:
+                    r = requests.get(self.thumb_url, timeout=10)
+                    r.raise_for_status()
+                    self.thumbnail_ready.emit(r.content)
+                except Exception:
+                    pass
+
             opts = self.ydl_opts
             opts["progress_hooks"] = [self._hook]
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -424,7 +473,7 @@ class DownloadWorker(QThread):
         except DownloadCancelled:
             self.done.emit(False, "Cancelled", "")
         except yt_dlp.utils.DownloadError as e:
-            if "cancelled by user" in str(e).lower():
+            if "cancel" + "ed by user" in str(e).lower():
                 self.done.emit(False, "Cancelled", "")
             else:
                 self.done.emit(False, str(e).replace("ERROR:", "").strip()[:200], "")
@@ -766,16 +815,12 @@ class DownloadItem(QFrame):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(12, 10, 12, 10)
 
-        thumb_label = QLabel()
-        thumb_label.setFixedSize(120, 68)
-        thumb_label.setScaledContents(True)
-        thumb_label.setStyleSheet(
+        self.thumb_label = QLabel()
+        self.thumb_label.setFixedSize(120, 68)
+        self.thumb_label.setScaledContents(True)
+        self.thumb_label.setStyleSheet(
             "background-color: rgba(128,128,128,0.15); border-radius: 6px;")
-        if thumb:
-            pix = QPixmap()
-            pix.loadFromData(thumb)
-            thumb_label.setPixmap(pix)
-        lay.addWidget(thumb_label)
+        lay.addWidget(self.thumb_label)
 
         mid = QVBoxLayout()
         self.title_label = QLabel(title)
@@ -787,11 +832,19 @@ class DownloadItem(QFrame):
         self.meta_label.setStyleSheet("color: gray; font-size: 11px;")
         mid.addWidget(self.meta_label)
 
+        # Progress bar + live speed label on one row
+        pbar_row = QHBoxLayout()
+        pbar_row.setSpacing(8)
         self.bar = QProgressBar()
         self.bar.setRange(0, 1000)
         self.bar.setValue(0)
         self.bar.setFixedHeight(8)
-        mid.addWidget(self.bar)
+        pbar_row.addWidget(self.bar, 1)
+        self.speed_label = QLabel("")
+        self.speed_label.setFixedWidth(150)
+        self.speed_label.setStyleSheet("color: gray; font-size: 11px;")
+        pbar_row.addWidget(self.speed_label)
+        mid.addLayout(pbar_row)
 
         self.stat_label = QLabel("Queued...")
         self.stat_label.setStyleSheet("color: gray; font-size: 11px;")
@@ -811,7 +864,45 @@ class DownloadItem(QFrame):
         lay.addLayout(self.btns_layout)
 
         worker.progress.connect(self.on_progress)
+        worker.progress_update.connect(self.on_progress_update)
+        worker.thumbnail_ready.connect(self.on_thumbnail_ready)
         worker.done.connect(self.on_done)
+
+        if thumb:
+            self._set_cropped_thumbnail(thumb)
+
+    # -- thumbnail (async bytes -> square, centered crop) ---------------
+    def on_thumbnail_ready(self, data: bytes):
+        if data:
+            self._set_cropped_thumbnail(data)
+
+    def _set_cropped_thumbnail(self, data: bytes):
+        """Scale with expanding aspect ratio, then center-crop into the box
+        via a QPainter so the image fills the thumb square without stretch."""
+        pix = QPixmap()
+        if not data or not pix.loadFromData(data):
+            return
+        w, h = 120, 68
+        scaled = pix.scaled(w, h,
+                            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                            Qt.TransformationMode.SmoothTransformation)
+        canvas = QPixmap(w, h)
+        canvas.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(canvas)
+        x = (w - scaled.width()) // 2
+        y = (h - scaled.height()) // 2
+        painter.drawPixmap(x, y, scaled)
+        painter.end()
+        self.thumb_label.setScaledContents(False)
+        self.thumb_label.setPixmap(canvas)
+
+    # -- progress --------------------------------------------------------
+    def on_progress_update(self, percent: float, speed: str):
+        self.bar.setValue(int(percent * 10))   # 0-1000
+        if speed:
+            self.speed_label.setText(f"Downloading... {speed}")
+        elif self.bar.value() >= 1000:
+            self.speed_label.setText("Done")
 
     def toggle_pause(self):
         self.worker.is_paused = not self.worker.is_paused
@@ -826,20 +917,38 @@ class DownloadItem(QFrame):
         self.worker.is_cancelled = True
         self.worker.is_paused = False
         self.stat_label.setText("Cancelling...")
+        self.speed_label.setText("Canceled")
+        self._hide_ctrl_buttons()
+        self._inject_remove_button()
+
+    def _hide_ctrl_buttons(self):
+        self.pause_btn.hide()
+        self.cancel_btn.hide()
+
+    def _inject_remove_button(self):
+        if getattr(self, "_remove_btn", None) is not None:
+            return
+        self._remove_btn = QPushButton("  Remove")
+        self._remove_btn.setIcon(qta.icon("fa5s.trash", color="#e6edf3"))
+        self._remove_btn.setFixedWidth(110)
+        self._remove_btn.setStyleSheet(
+            "background-color: #30363d; border: none; color: #e6edf3;"
+            "border-radius: 6px; padding: 6px 10px;")
+        self._remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._remove_btn.clicked.connect(self._remove_from_list)
+        self.btns_layout.addWidget(self._remove_btn)
 
     def on_progress(self, d: dict):
         self.bar.setValue(int(d.get("fraction", 0) * 1000))
         if d.get("processing"):
             self.stat_label.setText("Processing with ffmpeg...")
+            self.speed_label.setText("")
             return
-        speed = d.get("speed")
         eta = d.get("eta")
         parts = [f"{d.get('fraction', 0) * 100:.1f}%"]
         if d.get("total"):
             parts.append(f"{human_size(d['downloaded'])} / "
                          f"{human_size(d['total'])}")
-        if speed:
-            parts.append(f"{speed / 1048576:.2f} MB/s")
         if eta:
             parts.append(f"ETA {eta}s")
         self.stat_label.setText("  ·  ".join(parts))
@@ -849,6 +958,7 @@ class DownloadItem(QFrame):
 
         if ok:
             self.bar.setValue(1000)
+            self.speed_label.setText("Done")
             self.stat_label.setText("✅ " + msg)
             self.stat_label.setStyleSheet(
                 "color: #3fb950; font-size: 11px; font-weight: bold;")
@@ -856,6 +966,8 @@ class DownloadItem(QFrame):
         else:
             self.pause_btn.setEnabled(False)
             self.cancel_btn.setEnabled(False)
+            self._hide_ctrl_buttons()
+            self._inject_remove_button()
             self.stat_label.setText("❌ " + msg)
             self.stat_label.setStyleSheet("color: #ff5555; font-size: 11px;")
 
@@ -1454,7 +1566,8 @@ class MainWindow(QMainWindow):
             meta_parts.append(uploader)
         meta = "  ·  ".join(str(p) for p in meta_parts if p and p != "?")
 
-        worker = DownloadWorker(url, ydl_opts)
+        worker = DownloadWorker(
+            url, ydl_opts, thumb_url=display.get("thumbnail") or "")
         item = DownloadItem(title, meta, thumb, kind, worker)
         self.downloads_page.add_item(item)
         self.workers.append(worker)

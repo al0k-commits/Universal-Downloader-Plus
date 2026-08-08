@@ -1,0 +1,156 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WiX Toolset v3 source for the Universal Downloader+ MSI.
+
+  Compiled by .github/workflows/release.yml roughly like:
+
+      candle.exe -nologo -arch x64 ^
+                 -dProductVersion=1.0.0 ^
+                 -dSourceDir=dist ^
+                 -out obj\installer.wixobj installer.wxs
+      light.exe  -nologo -spdb -ext WixUIExtension ^
+                 -out artifacts\UniversalDownloaderPlus-v1.0.0-windows-x64.msi ^
+                 obj\installer.wixobj
+
+  -arch also sets the MSI Package/@Platform, so the same file produces both the
+  x64 and the arm64 installer. ProgramFiles64Folder resolves to the native
+  "Program Files" directory on both.
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+
+  <?ifndef ProductVersion ?>
+    <?define ProductVersion = "1.0.0" ?>
+  <?endif?>
+
+  <!-- Root of the PyInstaller output that is being harvested. -->
+  <?ifndef SourceDir ?>
+    <?define SourceDir = "dist" ?>
+  <?endif?>
+
+  <?define ProductName    = "Universal Downloader+" ?>
+  <?define Manufacturer   = "Alok" ?>
+  <?define ExeName        = "UniversalDownloaderPlus.exe" ?>
+
+  <!--
+    UpgradeCode is per-architecture on purpose. Windows Installer cannot perform
+    a major upgrade across processor architectures, so an x64 install and an
+    arm64 install are treated as separate products rather than as a broken
+    upgrade path.
+  -->
+  <?if $(sys.BUILDARCH) = arm64 ?>
+    <?define UpgradeCode = "7C6E2B2E-7B4B-4C1D-9E2C-2F1A9B4D6A11" ?>
+  <?else?>
+    <?define UpgradeCode = "3F1B54A9-0C2E-4E77-93A5-8C6C1D2E5B02" ?>
+  <?endif?>
+
+  <Product Id="*"
+           Name="$(var.ProductName)"
+           Language="1033"
+           Version="$(var.ProductVersion)"
+           Manufacturer="$(var.Manufacturer)"
+           UpgradeCode="$(var.UpgradeCode)">
+
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Description="$(var.ProductName) $(var.ProductVersion) installer"
+             Manufacturer="$(var.Manufacturer)" />
+
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of $(var.ProductName) is already installed." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Add/Remove Programs metadata. -->
+    <Icon Id="AppIcon.exe" SourceFile="$(var.SourceDir)\$(var.ExeName)" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon.exe" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/al0k-commits/Universal-Downloader-Plus" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/al0k-commits/Universal-Downloader-Plus/issues" />
+    <Property Id="ARPNOREPAIR" Value="1" Secure="yes" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="$(var.ProductName)">
+          <Directory Id="FFMPEGFOLDER" Name="ffmpeg" />
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ApplicationProgramsFolder" Name="$(var.ProductName)" />
+      </Directory>
+      <Directory Id="DesktopFolder" Name="Desktop" />
+    </Directory>
+
+    <!--
+      The application itself. FFMPEG_DIR resolves to <exe dir>\ffmpeg when the
+      app is frozen, so ffmpeg.exe / ffprobe.exe must land in a sibling folder,
+      exactly like the portable build.
+    -->
+    <ComponentGroup Id="ApplicationFiles">
+      <Component Id="cmpMainExe" Directory="INSTALLFOLDER" Guid="*" Win64="yes">
+        <File Id="filMainExe"
+              Name="$(var.ExeName)"
+              Source="$(var.SourceDir)\$(var.ExeName)"
+              KeyPath="yes">
+          <Shortcut Id="StartMenuShortcut"
+                    Directory="ApplicationProgramsFolder"
+                    Name="$(var.ProductName)"
+                    Description="Download video and audio from the web"
+                    WorkingDirectory="INSTALLFOLDER"
+                    Advertise="yes" />
+          <Shortcut Id="DesktopShortcut"
+                    Directory="DesktopFolder"
+                    Name="$(var.ProductName)"
+                    WorkingDirectory="INSTALLFOLDER"
+                    Advertise="yes" />
+        </File>
+      </Component>
+
+      <Component Id="cmpFfmpeg" Directory="FFMPEGFOLDER" Guid="*" Win64="yes">
+        <File Id="filFfmpeg"
+              Name="ffmpeg.exe"
+              Source="$(var.SourceDir)\ffmpeg\ffmpeg.exe"
+              KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmpFfprobe" Directory="FFMPEGFOLDER" Guid="*" Win64="yes">
+        <File Id="filFfprobe"
+              Name="ffprobe.exe"
+              Source="$(var.SourceDir)\ffmpeg\ffprobe.exe"
+              KeyPath="yes" />
+      </Component>
+
+      <!-- Owns the Start Menu directory so uninstall removes it cleanly. -->
+      <Component Id="cmpProgramMenuDir" Directory="ApplicationProgramsFolder" Guid="*" Win64="yes">
+        <RemoveFolder Id="rmApplicationProgramsFolder" On="uninstall" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\$(var.Manufacturer)\$(var.ProductName)"
+                       Name="installed"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="MainFeature" Title="$(var.ProductName)" Level="1" Absent="disallow">
+      <ComponentGroupRef Id="ApplicationFiles" />
+    </Feature>
+
+    <!-- Minimal one-page UI plus a "launch when finished" checkbox. -->
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch $(var.ProductName)" />
+    <Property Id="WixShellExecTarget" Value="[#filMainExe]" />
+    <CustomAction Id="LaunchApplication"
+                  BinaryKey="WixCA"
+                  DllEntry="WixShellExec"
+                  Impersonate="yes"
+                  Return="asyncNoWait" />
+    <UIRef Id="WixUI_Minimal" />
+    <UI>
+      <Publish Dialog="ExitDialog"
+               Control="Finish"
+               Event="DoAction"
+               Value="LaunchApplication">WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed</Publish>
+    </UI>
+
+  </Product>
+</Wix>

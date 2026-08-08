@@ -14,9 +14,14 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  APP_NAME: UniversalDownloaderPlus
+  PRODUCT_NAME: "Universal Downloader+"
+  WIX3_URL: https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip
+
 jobs:
   build:
-    name: Build (${{ matrix.os }})
+    name: Build (${{ matrix.slug }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -24,13 +29,25 @@ jobs:
         include:
           - os: windows-latest
             slug: windows-x64
-            exe_name: UniversalDownloaderPlus.exe
+            py_arch: x64
+            wix_arch: x64
+            ffmpeg_arch: win64
+
+          # GitHub-hosted Windows-on-ARM runner (Snapdragon / Ryzen AI class).
+          # Free for public repos; label is `windows-11-arm`.
+          - os: windows-11-arm
+            slug: windows-arm64
+            py_arch: arm64
+            wix_arch: arm64
+            ffmpeg_arch: winarm64
+
           - os: macos-latest
             slug: macos-arm64
-            exe_name: UniversalDownloaderPlus.app
+            py_arch: arm64
+
           - os: ubuntu-latest
             slug: linux-x64
-            exe_name: UniversalDownloaderPlus
+            py_arch: x64
 
     steps:
       - name: Checkout
@@ -40,6 +57,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          architecture: ${{ matrix.py_arch }}
           cache: pip
 
       # Qt WebEngine needs these X/GL libs present even to *build* cleanly,
@@ -63,34 +81,49 @@ jobs:
       # ------------------------------------------------------------------
       # Derive the version once. Tag pushes use the tag; manual runs get a
       # dev stamp so the artifact name is never empty.
+      #
+      # msi_version is the same value reduced to a strict x.y.z numeric form,
+      # because Windows Installer rejects anything else in ProductVersion.
       # ------------------------------------------------------------------
       - name: Resolve version
         id: ver
         shell: bash
         run: |
+          set -euo pipefail
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            VERSION="${GITHUB_REF_NAME}"
           else
-            echo "version=v0.0.0-dev.${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            VERSION="v0.0.0-dev.${GITHUB_SHA::7}"
           fi
+          NUMERIC="${VERSION#v}"     # drop leading v
+          NUMERIC="${NUMERIC%%-*}"   # drop any -rc1 / -dev.abc1234 suffix
+          if [[ ! "$NUMERIC" =~ ^[0-9]+(\.[0-9]+){0,3}$ ]]; then
+            NUMERIC="0.0.0"
+          fi
+          echo "version=${VERSION}"       >> "$GITHUB_OUTPUT"
+          echo "msi_version=${NUMERIC}"   >> "$GITHUB_OUTPUT"
+          echo "basename=${APP_NAME}-${VERSION}-${{ matrix.slug }}" >> "$GITHUB_OUTPUT"
 
       # ==================================================================
       # FFmpeg: fetch static ffmpeg + ffprobe into ./ffmpeg at the repo root.
       # FFMPEG_DIR resolves to <exe dir>/ffmpeg when frozen, so these get
       # staged beside the binary further down.
       # ==================================================================
+      #
+      # BtbN publishes both win64 and winarm64 static builds from one release,
+      # so a single step covers both Windows matrix legs.
       - name: Fetch FFmpeg (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL --retry 3 -o ffmpeg.zip \
-            https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
+          URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-${{ matrix.ffmpeg_arch }}-gpl.zip"
+          curl -fsSL --retry 3 -o ffmpeg.zip "$URL"
           unzip -qo ffmpeg.zip
           mkdir -p ffmpeg
           cp ffmpeg-*/bin/ffmpeg.exe  ffmpeg/
           cp ffmpeg-*/bin/ffprobe.exe ffmpeg/
-          rm -rf ffmpeg-*/ ffmpeg.zip
+          rm -rf ffmpeg-master-latest-*/ ffmpeg.zip
           ./ffmpeg/ffmpeg.exe -version | head -n 1
 
       - name: Fetch FFmpeg (Linux)
@@ -136,7 +169,7 @@ jobs:
         shell: bash
         run: |
           python -m PyInstaller --noconfirm --clean --onefile --windowed \
-            --name UniversalDownloaderPlus \
+            --name "${APP_NAME}" \
             --icon src/universal_downloader/resources/icon.ico \
             --add-data "src/universal_downloader/resources;resources" \
             --collect-all PyQt6.QtWebEngineWidgets \
@@ -149,7 +182,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           python -m PyInstaller --noconfirm --clean --onefile --windowed \
-            --name UniversalDownloaderPlus \
+            --name "${APP_NAME}" \
             --add-data "src/universal_downloader/resources:resources" \
             --collect-all PyQt6.QtWebEngineWidgets \
             --collect-all PyQt6.QtWebEngineCore \
@@ -162,7 +195,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           python -m PyInstaller --noconfirm --clean --windowed \
-            --name UniversalDownloaderPlus \
+            --name "${APP_NAME}" \
             --icon src/universal_downloader/resources/icon.icns \
             --add-data "src/universal_downloader/resources:resources" \
             --collect-all PyQt6.QtWebEngineWidgets \
@@ -187,23 +220,27 @@ jobs:
         run: |
           # sys.executable inside a bundle is Contents/MacOS/<name>, so
           # FFMPEG_DIR resolves to Contents/MacOS/ffmpeg.
-          mkdir -p "dist/UniversalDownloaderPlus.app/Contents/MacOS/ffmpeg"
+          mkdir -p "dist/${APP_NAME}.app/Contents/MacOS/ffmpeg"
           cp ffmpeg/ffmpeg ffmpeg/ffprobe \
-            "dist/UniversalDownloaderPlus.app/Contents/MacOS/ffmpeg/"
-          ls -la "dist/UniversalDownloaderPlus.app/Contents/MacOS/ffmpeg/"
+            "dist/${APP_NAME}.app/Contents/MacOS/ffmpeg/"
+          ls -la "dist/${APP_NAME}.app/Contents/MacOS/ffmpeg/"
 
       # ==================================================================
       # Code signing, branded "Alok".
       # NOTE: a self-signed cert is NOT trusted by SmartScreen/Gatekeeper on
       # end-user machines. It proves integrity, not identity. Users will still
       # see a warning; real trust needs a paid OV/EV cert or an Apple Dev ID.
+      #
+      # The thumbprint is exported so the MSI produced later can be signed with
+      # the *same* certificate instead of generating a second one.
       # ==================================================================
       - name: Sign Windows EXE (self-signed "Alok")
+        id: winsign
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $exe = "dist\UniversalDownloaderPlus.exe"
+          $exe = "dist\$env:APP_NAME.exe"
 
           $cert = New-SelfSignedCertificate `
             -DnsName "Alok" `
@@ -214,14 +251,18 @@ jobs:
             -KeyUsageProperty All `
             -NotAfter (Get-Date).AddYears(3)
           Write-Host "Certificate thumbprint: $($cert.Thumbprint)"
+          "thumbprint=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
+          # On an arm64 runner the x64 SignTool still runs fine under emulation,
+          # so accept either host architecture directory.
           $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" `
             -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match 'x64' } |
+            Where-Object { $_.FullName -match '\\(x64|arm64)\\' } |
             Sort-Object FullName -Descending | Select-Object -First 1
 
           if ($signtool) {
             Write-Host "Using SignTool: $($signtool.FullName)"
+            "signtool=$($signtool.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             # Timestamping keeps the signature valid past cert expiry.
             & $signtool.FullName sign `
               /sha1 $cert.Thumbprint /fd SHA256 `
@@ -230,6 +271,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "signtool failed ($LASTEXITCODE)" }
           } else {
             Write-Host "SignTool not found - falling back to Set-AuthenticodeSignature."
+            "signtool=" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             $sig = Set-AuthenticodeSignature -FilePath $exe -Certificate $cert `
               -HashAlgorithm SHA256 -TimestampServer "http://timestamp.digicert.com"
             if ($sig.Status -ne "Valid" -and $sig.Status -ne "UnknownError") {
@@ -243,7 +285,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
-          APP="dist/UniversalDownloaderPlus.app"
+          APP="dist/${APP_NAME}.app"
           # Sign the FFmpeg binaries first: --deep does not reliably cover
           # executables we copied in after PyInstaller finished.
           codesign --force --sign - --timestamp=none \
@@ -261,10 +303,10 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          file dist/UniversalDownloaderPlus
+          file "dist/${APP_NAME}"
           test -x dist/ffmpeg/ffmpeg
           # Launch briefly under Xvfb; a clean timeout means it booted OK.
-          timeout 25s xvfb-run -a ./dist/UniversalDownloaderPlus || rc=$?
+          timeout 25s xvfb-run -a "./dist/${APP_NAME}" || rc=$?
           if [ "${rc:-0}" -ne 0 ] && [ "${rc:-0}" -ne 124 ]; then
             echo "::error::Frozen binary exited with $rc"; exit 1
           fi
@@ -274,7 +316,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          test -f dist/UniversalDownloaderPlus.exe
+          test -f "dist/${APP_NAME}.exe"
           test -f dist/ffmpeg/ffmpeg.exe
           test -f dist/ffmpeg/ffprobe.exe
           echo "Artifacts present."
@@ -282,40 +324,183 @@ jobs:
       - name: Verify build output (macOS)
         if: runner.os == 'macOS'
         run: |
-          test -d "dist/UniversalDownloaderPlus.app"
-          test -x "dist/UniversalDownloaderPlus.app/Contents/MacOS/ffmpeg/ffmpeg"
+          test -d "dist/${APP_NAME}.app"
+          test -x "dist/${APP_NAME}.app/Contents/MacOS/ffmpeg/ffmpeg"
           echo "Bundle present."
 
+      - name: Create artifacts directory
+        shell: bash
+        run: mkdir -p artifacts
+
       # ==================================================================
-      # Package → UniversalDownloaderPlus-<version>-<os>.zip
+      # WINDOWS PACKAGING
+      #   1. portable  -> <basename>.exe
+      #   2. installer -> <basename>.msi   (WiX v3: candle + light)
       # ==================================================================
-      - name: Zip artifacts
-        id: pack
+      - name: Package portable EXE (Windows)
+        if: runner.os == 'Windows'
         shell: bash
         run: |
           set -euo pipefail
-          NAME="UniversalDownloaderPlus-${{ steps.ver.outputs.version }}-${{ matrix.slug }}"
-          mkdir -p artifacts
-          if [[ "${RUNNER_OS}" == "macOS" ]]; then
-            # ditto preserves symlinks, resource forks and the signature.
-            ditto -c -k --sequesterRsrc --keepParent \
-              "dist/UniversalDownloaderPlus.app" "artifacts/${NAME}.zip"
-            # Re-add ffmpeg staged outside the signed bundle root, if any.
-          else
-            python - "$NAME" <<'PY'
-          import shutil, sys
-          shutil.make_archive(f"artifacts/{sys.argv[1]}", "zip", "dist")
-          PY
-          fi
-          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
-          ls -la artifacts/
+          cp "dist/${APP_NAME}.exe" "artifacts/${{ steps.ver.outputs.basename }}.exe"
+
+      # windows-latest ships WiX v3.14 preinstalled. windows-11-arm currently
+      # does not, so fall back to the official binaries zip (x86 tooling, which
+      # runs fine under emulation and can still target -arch arm64).
+      - name: Locate or install WiX Toolset
+        id: wix
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $candle = Get-ChildItem "C:\Program Files (x86)" -Recurse -Filter candle.exe `
+                      -ErrorAction SilentlyContinue |
+                    Sort-Object FullName -Descending | Select-Object -First 1
+
+          if (-not $candle -and $env:WIX) {
+            $probe = Join-Path $env:WIX "bin\candle.exe"
+            if (Test-Path $probe) { $candle = Get-Item $probe }
+          }
+
+          if (-not $candle) {
+            Write-Host "WiX not preinstalled - downloading wix314-binaries..."
+            $zip = Join-Path $env:RUNNER_TEMP "wix314.zip"
+            $dir = Join-Path $env:RUNNER_TEMP "wix314"
+            Invoke-WebRequest -Uri $env:WIX3_URL -OutFile $zip -UseBasicParsing
+            Expand-Archive -Path $zip -DestinationPath $dir -Force
+            $candle = Get-Item (Join-Path $dir "candle.exe")
+          }
+
+          $bin = Split-Path -Parent $candle.FullName
+          Write-Host "WiX bin: $bin"
+          "bin=$bin" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          & $candle.FullName -? | Select-Object -First 2
+
+      - name: Build MSI installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          MSI_VERSION: ${{ steps.ver.outputs.msi_version }}
+          WIX_ARCH: ${{ matrix.wix_arch }}
+          OUT_BASENAME: ${{ steps.ver.outputs.basename }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $candle = Join-Path "${{ steps.wix.outputs.bin }}" "candle.exe"
+          $light  = Join-Path "${{ steps.wix.outputs.bin }}" "light.exe"
+          New-Item -ItemType Directory -Force -Path "obj" | Out-Null
+
+          & $candle -nologo `
+            -arch $env:WIX_ARCH `
+            -dProductVersion="$env:MSI_VERSION" `
+            -dSourceDir="dist" `
+            -ext WixUtilExtension `
+            -out "obj\installer.wixobj" `
+            "installer.wxs"
+          if ($LASTEXITCODE -ne 0) { throw "candle failed ($LASTEXITCODE)" }
+
+          & $light -nologo -spdb `
+            -ext WixUIExtension -ext WixUtilExtension `
+            -cultures:en-us `
+            -out "artifacts\$env:OUT_BASENAME.msi" `
+            "obj\installer.wixobj"
+          if ($LASTEXITCODE -ne 0) { throw "light failed ($LASTEXITCODE)" }
+
+          Get-Item "artifacts\$env:OUT_BASENAME.msi" | Format-List Name, Length
+
+      - name: Sign MSI (Windows)
+        if: runner.os == 'Windows' && steps.winsign.outputs.signtool != ''
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $msi = "artifacts\${{ steps.ver.outputs.basename }}.msi"
+          & "${{ steps.winsign.outputs.signtool }}" sign `
+            /sha1 "${{ steps.winsign.outputs.thumbprint }}" /fd SHA256 `
+            /tr http://timestamp.digicert.com /td SHA256 `
+            $msi
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed on MSI ($LASTEXITCODE)" }
+          Get-AuthenticodeSignature $msi | Format-List Status, StatusMessage
+
+      # ==================================================================
+      # macOS PACKAGING -> <basename>.dmg
+      # A staging folder plus an /Applications symlink gives the familiar
+      # "drag the icon into the folder" installer window.
+      # ==================================================================
+      - name: Create DMG (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          NAME="${{ steps.ver.outputs.basename }}"
+          STAGE="$(mktemp -d)/dmg"
+          mkdir -p "$STAGE"
+
+          # ditto (not cp) preserves symlinks, resource forks and the signature.
+          ditto "dist/${APP_NAME}.app" "$STAGE/${APP_NAME}.app"
+          ln -s /Applications "$STAGE/Applications"
+
+          hdiutil create \
+            -volname "${PRODUCT_NAME}" \
+            -srcfolder "$STAGE" \
+            -fs HFS+ \
+            -format UDZO \
+            -imagekey zlib-level=9 \
+            -ov \
+            "artifacts/${NAME}.dmg"
+
+          hdiutil verify "artifacts/${NAME}.dmg"
+          # Ad-hoc sign the image itself so the signature survives download.
+          codesign --force --sign - "artifacts/${NAME}.dmg"
+          ls -lh "artifacts/${NAME}.dmg"
+
+      # ==================================================================
+      # LINUX PACKAGING -> <basename>.tar.gz
+      # Archived with a top-level directory so it does not explode into $PWD.
+      # ==================================================================
+      - name: Create tar.gz (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          NAME="${{ steps.ver.outputs.basename }}"
+          STAGE="$(mktemp -d)"
+          mkdir -p "$STAGE/${NAME}"
+          cp -a dist/. "$STAGE/${NAME}/"
+          chmod +x "$STAGE/${NAME}/${APP_NAME}" \
+                   "$STAGE/${NAME}/ffmpeg/ffmpeg" \
+                   "$STAGE/${NAME}/ffmpeg/ffprobe"
+          tar -czf "artifacts/${NAME}.tar.gz" -C "$STAGE" "${NAME}"
+          tar -tzf "artifacts/${NAME}.tar.gz" | head -n 10
+          ls -lh "artifacts/${NAME}.tar.gz"
+
+      # ==================================================================
+      # Checksums + upload
+      # ==================================================================
+      - name: Generate SHA256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd artifacts
+          for f in *; do
+            case "$f" in *.sha256) continue;; esac
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$f" > "$f.sha256"
+            else
+              shasum -a 256 "$f" > "$f.sha256"
+            fi
+          done
+          ls -la
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.pack.outputs.name }}
-          path: artifacts/*.zip
+          name: ${{ steps.ver.outputs.basename }}
+          path: |
+            artifacts/*.exe
+            artifacts/*.msi
+            artifacts/*.dmg
+            artifacts/*.tar.gz
+            artifacts/*.sha256
           retention-days: 14
+          if-no-files-found: error
 
       - name: Publish to GitHub Release
         if: github.ref_type == 'tag'
@@ -326,19 +511,37 @@ jobs:
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: false
           body: |
             ## Universal Downloader+ ${{ github.ref_name }}
 
             Standalone builds for Windows, macOS and Linux — FFmpeg is bundled,
             no separate install required.
 
-            | Platform | Asset |
-            |---|---|
-            | Windows x64 | `UniversalDownloaderPlus-${{ github.ref_name }}-windows-x64.zip` |
-            | macOS arm64 | `UniversalDownloaderPlus-${{ github.ref_name }}-macos-arm64.zip` |
-            | Linux x64   | `UniversalDownloaderPlus-${{ github.ref_name }}-linux-x64.zip` |
+            | Platform | Installer | Portable |
+            |---|---|---|
+            | Windows x64 (Intel/AMD)      | `UniversalDownloaderPlus-${{ github.ref_name }}-windows-x64.msi`   | `UniversalDownloaderPlus-${{ github.ref_name }}-windows-x64.exe`   |
+            | Windows arm64 (Snapdragon)   | `UniversalDownloaderPlus-${{ github.ref_name }}-windows-arm64.msi` | `UniversalDownloaderPlus-${{ github.ref_name }}-windows-arm64.exe` |
+            | macOS arm64 (Apple Silicon)  | `UniversalDownloaderPlus-${{ github.ref_name }}-macos-arm64.dmg`   | — |
+            | Linux x64                    | —                                                                  | `UniversalDownloaderPlus-${{ github.ref_name }}-linux-x64.tar.gz`  |
+
+            Every asset ships a matching `.sha256` file.
+
+            **Windows:** the `.msi` is the recommended install — it places
+            `ffmpeg.exe`/`ffprobe.exe` next to the app and creates shortcuts.
+            The bare `.exe` is portable, but you must keep an `ffmpeg/` folder
+            beside it for merging/conversion to work.
+
+            **macOS:** open the `.dmg` and drag the app into Applications.
+
+            **Linux:** `tar -xzf <file>.tar.gz && ./UniversalDownloaderPlus-*/UniversalDownloaderPlus`
 
             > **Security notice:** these binaries are self-signed / ad-hoc signed.
             > Windows SmartScreen and macOS Gatekeeper will still warn on first run.
-            > On macOS: `xattr -dr com.apple.quarantine UniversalDownloaderPlus.app`
-          files: artifacts/*.zip
+            > On macOS: `xattr -dr com.apple.quarantine /Applications/UniversalDownloaderPlus.app`
+          files: |
+            artifacts/*.exe
+            artifacts/*.msi
+            artifacts/*.dmg
+            artifacts/*.tar.gz
+            artifacts/*.sha256

@@ -7,7 +7,7 @@ name = "universal-downloader-plus"
 version = "1.0.0"
 description = "PyQt6 + yt-dlp desktop video downloader with an embedded Chromium browser, persistent logins, playlist queueing, and pause/resume/cancel downloads."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.12"
 license = { text = "MIT" }
 authors = [{ name = "Alok", email = "al0k-commits@users.noreply.github.com" }]
 maintainers = [{ name = "Alok", email = "al0k-commits@users.noreply.github.com" }]
@@ -19,7 +19,6 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
     "Operating System :: Microsoft :: Windows",
     "Operating System :: MacOS :: MacOS X",
     "Operating System :: POSIX :: Linux",
@@ -27,8 +26,10 @@ classifiers = [
     "Topic :: Multimedia :: Video",
 ]
 dependencies = [
-    "PyQt6>=6.6.0",
-    "PyQt6-WebEngine>=6.6.0",
+    # 6.9.0 is the first release with win_arm64 wheels for *both* PyQt6 and
+    # PyQt6-WebEngine. Lowering these floors breaks the windows-arm64 build.
+    "PyQt6>=6.9.0",
+    "PyQt6-WebEngine>=6.9.0",
     "qtawesome>=1.3.0",
     "pyqtdarktheme>=2.1.0",
     "yt-dlp>=2025.1.1",

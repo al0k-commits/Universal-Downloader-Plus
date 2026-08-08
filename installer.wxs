@@ -139,11 +139,19 @@
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch $(var.ProductName)" />
     <Property Id="WixShellExecTarget" Value="[#filMainExe]" />
+    <!--
+      Return must be "ignore", not "asyncNoWait": asyncNoWait is only valid for
+      EXE-type custom actions, and this is a DLL entry point (CNDL0038).
+      WixShellExec is already non-blocking - it calls ShellExecute and returns -
+      so the installer still exits immediately. "ignore" also means a failed
+      launch cannot roll back an otherwise successful install.
+    -->
     <CustomAction Id="LaunchApplication"
                   BinaryKey="WixCA"
                   DllEntry="WixShellExec"
                   Impersonate="yes"
-                  Return="asyncNoWait" />
+                  Execute="immediate"
+                  Return="ignore" />
     <UIRef Id="WixUI_Minimal" />
     <UI>
       <Publish Dialog="ExitDialog"

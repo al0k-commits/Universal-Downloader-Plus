@@ -56,7 +56,9 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          # Pinned to 3.11: pyqtdarktheme 2.1.0 declares Requires-Python
+          # ">=3.7,<3.12" and has no 3.12 distribution on PyPI.
+          python-version: "3.11"
           architecture: ${{ matrix.py_arch }}
           cache: pip
 

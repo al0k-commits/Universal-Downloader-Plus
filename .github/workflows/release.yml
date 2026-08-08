@@ -1,12 +1,18 @@
-name: Release
+name: Build & Release
 
 on:
   push:
     tags:
       - "v*"
+  # Allows a dry-run build from the Actions tab without cutting a release.
+  workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -17,17 +23,14 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            artifact: UniversalDownloader-windows-x64.zip
-            exe_name: UniversalDownloader.exe
-            ffmpeg_dir: ffmpeg
-          - os: ubuntu-latest
-            artifact: UniversalDownloader-linux-x64.zip
-            exe_name: UniversalDownloader
-            ffmpeg_dir: ffmpeg
+            slug: windows-x64
+            exe_name: UniversalDownloaderPlus.exe
           - os: macos-latest
-            artifact: UniversalDownloader-macos-universal.zip
-            exe_name: UniversalDownloader
-            ffmpeg_dir: ffmpeg
+            slug: macos-arm64
+            exe_name: UniversalDownloaderPlus.app
+          - os: ubuntu-latest
+            slug: linux-x64
+            exe_name: UniversalDownloaderPlus
 
     steps:
       - name: Checkout
@@ -39,6 +42,18 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      # Qt WebEngine needs these X/GL libs present even to *build* cleanly,
+      # and they are required for the smoke test to import QtWebEngineWidgets.
+      - name: Install Linux Qt system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libegl1 libgl1 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 \
+            libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 \
+            libxcb-xinerama0 libxcb-cursor0 libnss3 libxdamage1 libxrandr2 \
+            libasound2t64 libatk-bridge2.0-0 libgbm1 xvfb
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -46,170 +61,284 @@ jobs:
           pip install pyinstaller
 
       # ------------------------------------------------------------------
-      # OS-specific FFmpeg binaries -> ./ffmpeg at the repository root so
-      # PyInstaller can bundle them and the app's FFMPEG_DIR check passes.
+      # Derive the version once. Tag pushes use the tag; manual runs get a
+      # dev stamp so the artifact name is never empty.
       # ------------------------------------------------------------------
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=v0.0.0-dev.${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ==================================================================
+      # FFmpeg: fetch static ffmpeg + ffprobe into ./ffmpeg at the repo root.
+      # FFMPEG_DIR resolves to <exe dir>/ffmpeg when frozen, so these get
+      # staged beside the binary further down.
+      # ==================================================================
       - name: Fetch FFmpeg (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          curl.exe -fsSL -o ffmpeg.zip https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
+          set -euo pipefail
+          curl -fsSL --retry 3 -o ffmpeg.zip \
+            https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
           unzip -qo ffmpeg.zip
           mkdir -p ffmpeg
-          cp ffmpeg-*/bin/ffmpeg.exe ffmpeg-*/bin/ffprobe.exe ffmpeg/
-          rm -rf ffmpeg-* ffmpeg.zip
-          ls -la ffmpeg/
+          cp ffmpeg-*/bin/ffmpeg.exe  ffmpeg/
+          cp ffmpeg-*/bin/ffprobe.exe ffmpeg/
+          rm -rf ffmpeg-*/ ffmpeg.zip
+          ./ffmpeg/ffmpeg.exe -version | head -n 1
 
       - name: Fetch FFmpeg (Linux)
         if: runner.os == 'Linux'
         run: |
-          curl -fsSL -o ffmpeg-static.tar.xz \
+          set -euo pipefail
+          curl -fsSL --retry 3 -o ffmpeg-static.tar.xz \
             https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
           tar -xJf ffmpeg-static.tar.xz
           mkdir -p ffmpeg
-          cp ffmpeg-*/ffmpeg ffmpeg-*/ffprobe ffmpeg/
+          cp ffmpeg-*-static/ffmpeg  ffmpeg/
+          cp ffmpeg-*-static/ffprobe ffmpeg/
           chmod +x ffmpeg/ffmpeg ffmpeg/ffprobe
-          rm -rf ffmpeg-* ffmpeg-static.tar.xz
-          ls -la ffmpeg/
+          rm -rf ffmpeg-*-static ffmpeg-static.tar.xz
+          ./ffmpeg/ffmpeg -version | head -n 1
 
+      # macos-latest is arm64. Most "static macOS ffmpeg" mirrors publish
+      # x86_64 only, which would produce a binary the app cannot exec.
+      # Homebrew gives a natively-executable build for the runner's arch.
       - name: Fetch FFmpeg (macOS)
         if: runner.os == 'macOS'
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
           HOMEBREW_NO_INSTALL_CLEANUP: "1"
         run: |
-          # macos-latest runners are arm64; the commonly-fetched build hosts
-          # (evermeet.cx etc.) ship x86_64 only, so use the runner's own
-          # package manager for a natively-executable universal build..
+          set -euo pipefail
           brew install ffmpeg
           mkdir -p ffmpeg
-          cp "$(brew --prefix ffmpeg)/bin/ffmpeg" ffmpeg/ffmpeg
+          cp "$(brew --prefix ffmpeg)/bin/ffmpeg"  ffmpeg/ffmpeg
           cp "$(brew --prefix ffmpeg)/bin/ffprobe" ffmpeg/ffprobe
-          ls -la ffmpeg/
+          chmod +x ffmpeg/ffmpeg ffmpeg/ffprobe
+          ./ffmpeg/ffmpeg -version | head -n 1
 
-      # ------------------------------------------------------------------
-      # PyInstaller. Separator: ; on Windows, : on Unix.
-      # ------------------------------------------------------------------
+      # ==================================================================
+      # PyInstaller. --add-data separator is ';' on Windows, ':' elsewhere.
+      # resources/ is bundled into sys._MEIPASS (get_resource_path reads it);
+      # ffmpeg is NOT bundled here -- it is staged next to the binary instead,
+      # because _MEIPASS is deleted on exit and FFMPEG_DIR points at the exe
+      # directory when frozen.
+      # ==================================================================
       - name: Build with PyInstaller (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
           python -m PyInstaller --noconfirm --clean --onefile --windowed \
-            --name UniversalDownloader \
+            --name UniversalDownloaderPlus \
             --icon src/universal_downloader/resources/icon.ico \
             --add-data "src/universal_downloader/resources;resources" \
-            --add-data "ffmpeg;ffmpeg" \
             --collect-all PyQt6.QtWebEngineWidgets \
             --collect-all PyQt6.QtWebEngineCore \
+            --collect-all qtawesome \
+            --collect-all yt_dlp \
             src/universal_downloader/__main__.py
 
       - name: Build with PyInstaller (Linux)
         if: runner.os == 'Linux'
         run: |
           python -m PyInstaller --noconfirm --clean --onefile --windowed \
-            --name UniversalDownloader \
-            --icon src/universal_downloader/resources/icon-512x512.png \
+            --name UniversalDownloaderPlus \
             --add-data "src/universal_downloader/resources:resources" \
-            --add-data "ffmpeg:ffmpeg" \
             --collect-all PyQt6.QtWebEngineWidgets \
             --collect-all PyQt6.QtWebEngineCore \
+            --collect-all qtawesome \
+            --collect-all yt_dlp \
             src/universal_downloader/__main__.py
 
+      # macOS ignores --onefile for windowed apps and emits a .app bundle.
       - name: Build with PyInstaller (macOS)
         if: runner.os == 'macOS'
-        env:
-          codesign_identity: "-"
         run: |
-          # Onefile is not supported on macOS - the .app bundle layout is used
-          # regardless. codesign_identity "-" performs an ad-hoc signature that
-          # PyInstaller will then hand to codesign (see signing step).
           python -m PyInstaller --noconfirm --clean --windowed \
-            --name UniversalDownloader \
+            --name UniversalDownloaderPlus \
             --icon src/universal_downloader/resources/icon.icns \
             --add-data "src/universal_downloader/resources:resources" \
-            --add-data "ffmpeg:ffmpeg" \
             --collect-all PyQt6.QtWebEngineWidgets \
             --collect-all PyQt6.QtWebEngineCore \
+            --collect-all qtawesome \
+            --collect-all yt_dlp \
             src/universal_downloader/__main__.py
 
-      # ------------------------------------------------------------------
-      # Place FFmpeg next to the executable so FFMPEG_DIR (=exe dir) resolves.
-      # ------------------------------------------------------------------
-      - name: Stage FFmpeg beside binary (Windows/Linux)
+      # ==================================================================
+      # Stage FFmpeg so FFMPEG_DIR (= dirname(sys.executable)/ffmpeg) hits.
+      # ==================================================================
+      - name: Stage FFmpeg beside binary (Windows / Linux)
         if: runner.os != 'macOS'
+        shell: bash
         run: |
           mkdir -p dist/ffmpeg
           cp ffmpeg/* dist/ffmpeg/
-          ls -la dist/
+          ls -la dist/ dist/ffmpeg/
 
       - name: Stage FFmpeg inside .app (macOS)
         if: runner.os == 'macOS'
         run: |
-          cp -r ffmpeg dist/UniversalDownloader.app/Contents/MacOS/ffmpeg
-          ls -la dist/UniversalDownloader.app/Contents/MacOS/
+          # sys.executable inside a bundle is Contents/MacOS/<name>, so
+          # FFMPEG_DIR resolves to Contents/MacOS/ffmpeg.
+          mkdir -p "dist/UniversalDownloaderPlus.app/Contents/MacOS/ffmpeg"
+          cp ffmpeg/ffmpeg ffmpeg/ffprobe \
+            "dist/UniversalDownloaderPlus.app/Contents/MacOS/ffmpeg/"
+          ls -la "dist/UniversalDownloaderPlus.app/Contents/MacOS/ffmpeg/"
 
-      # ------------------------------------------------------------------
-      # Self-signing / ad-hoc signing, branded "Alok".
-      # ------------------------------------------------------------------
+      # ==================================================================
+      # Code signing, branded "Alok".
+      # NOTE: a self-signed cert is NOT trusted by SmartScreen/Gatekeeper on
+      # end-user machines. It proves integrity, not identity. Users will still
+      # see a warning; real trust needs a paid OV/EV cert or an Apple Dev ID.
+      # ==================================================================
       - name: Sign Windows EXE (self-signed "Alok")
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $cert = New-SelfSignedCertificate -DnsName "Alok" `
-            -Subject "CN=Alok" `
+          $ErrorActionPreference = "Stop"
+          $exe = "dist\UniversalDownloaderPlus.exe"
+
+          $cert = New-SelfSignedCertificate `
+            -DnsName "Alok" `
+            -Subject "CN=Alok, O=Universal Downloader+, C=IN" `
             -CertStoreLocation "cert:\CurrentUser\My" `
             -Type CodeSigningCert `
             -KeyUsage DigitalSignature `
-            -KeyUsageProperty All
-          Write-Host "Cert thumbprint: $($cert.Thumbprint)"
+            -KeyUsageProperty All `
+            -NotAfter (Get-Date).AddYears(3)
+          Write-Host "Certificate thumbprint: $($cert.Thumbprint)"
 
-          # Windows SDK signtool if present, else PowerShell fallback.
           $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" `
             -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match 'x64' } |
             Sort-Object FullName -Descending | Select-Object -First 1
 
           if ($signtool) {
-            & $signtool.FullName sign /sha1 $cert.Thumbprint /n "Alok" /fd SHA256 `
+            Write-Host "Using SignTool: $($signtool.FullName)"
+            # Timestamping keeps the signature valid past cert expiry.
+            & $signtool.FullName sign `
+              /sha1 $cert.Thumbprint /fd SHA256 `
               /tr http://timestamp.digicert.com /td SHA256 `
-              dist\UniversalDownloader.exe
+              $exe
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed ($LASTEXITCODE)" }
           } else {
-            $sig = Set-AuthenticodeSignature `
-              -FilePath "dist\UniversalDownloader.exe" `
-              -Certificate $cert `
-              -HashAlgorithm SHA256 `
-              -TimestampServer "http://timestamp.digicert.com"
-            $sig.Status
+            Write-Host "SignTool not found - falling back to Set-AuthenticodeSignature."
+            $sig = Set-AuthenticodeSignature -FilePath $exe -Certificate $cert `
+              -HashAlgorithm SHA256 -TimestampServer "http://timestamp.digicert.com"
+            if ($sig.Status -ne "Valid" -and $sig.Status -ne "UnknownError") {
+              throw "Signing failed: $($sig.Status) - $($sig.StatusMessage)"
+            }
           }
-          Get-AuthenticodeSignature "dist\UniversalDownloader.exe" |
-            Select-Object Status, SignerCertificate
+
+          Get-AuthenticodeSignature $exe | Format-List Status, StatusMessage, SignerCertificate
 
       - name: Ad-hoc sign macOS .app ("Alok")
         if: runner.os == 'macOS'
         run: |
-          # --force reapplies; --deep covers nested Qt frameworks/binaries.
-          codesign --force --deep --sign - "dist/UniversalDownloader.app"
-          codesign --verify --verbose "dist/UniversalDownloader.app"
-          echo "signed by: $(codesign -dv --verbose=4 dist/UniversalDownloader.app 2>&1 | grep -i 'Signer identity')"
+          set -euo pipefail
+          APP="dist/UniversalDownloaderPlus.app"
+          # Sign the FFmpeg binaries first: --deep does not reliably cover
+          # executables we copied in after PyInstaller finished.
+          codesign --force --sign - --timestamp=none \
+            "$APP/Contents/MacOS/ffmpeg/ffmpeg" \
+            "$APP/Contents/MacOS/ffmpeg/ffprobe"
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --verbose=2 "$APP"
 
-      - name: Verify Linux binary is actually present
+      # ==================================================================
+      # Smoke test: prove the frozen binary actually starts. Catches missing
+      # Qt plugins / hidden imports that only surface after packaging.
+      # ==================================================================
+      - name: Smoke test frozen binary (Linux)
         if: runner.os == 'Linux'
-        run: file dist/UniversalDownloader
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          file dist/UniversalDownloaderPlus
+          test -x dist/ffmpeg/ffmpeg
+          # Launch briefly under Xvfb; a clean timeout means it booted OK.
+          timeout 25s xvfb-run -a ./dist/UniversalDownloaderPlus || rc=$?
+          if [ "${rc:-0}" -ne 0 ] && [ "${rc:-0}" -ne 124 ]; then
+            echo "::error::Frozen binary exited with $rc"; exit 1
+          fi
+          echo "Binary launched cleanly."
 
-      # ------------------------------------------------------------------
-      # Zip the dist/ output for the release.
-      # ------------------------------------------------------------------
-      - name: Zip artifacts
+      - name: Verify build output (Windows)
+        if: runner.os == 'Windows'
         shell: bash
         run: |
+          test -f dist/UniversalDownloaderPlus.exe
+          test -f dist/ffmpeg/ffmpeg.exe
+          test -f dist/ffmpeg/ffprobe.exe
+          echo "Artifacts present."
+
+      - name: Verify build output (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          test -d "dist/UniversalDownloaderPlus.app"
+          test -x "dist/UniversalDownloaderPlus.app/Contents/MacOS/ffmpeg/ffmpeg"
+          echo "Bundle present."
+
+      # ==================================================================
+      # Package → UniversalDownloaderPlus-<version>-<os>.zip
+      # ==================================================================
+      - name: Zip artifacts
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="UniversalDownloaderPlus-${{ steps.ver.outputs.version }}-${{ matrix.slug }}"
           mkdir -p artifacts
-          python -c "import shutil; shutil.make_archive('artifacts/${{ matrix.artifact }}'.replace('.zip',''), 'zip', 'dist')"
+          if [[ "${RUNNER_OS}" == "macOS" ]]; then
+            # ditto preserves symlinks, resource forks and the signature.
+            ditto -c -k --sequesterRsrc --keepParent \
+              "dist/UniversalDownloaderPlus.app" "artifacts/${NAME}.zip"
+            # Re-add ffmpeg staged outside the signed bundle root, if any.
+          else
+            python - "$NAME" <<'PY'
+          import shutil, sys
+          shutil.make_archive(f"artifacts/{sys.argv[1]}", "zip", "dist")
+          PY
+          fi
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
           ls -la artifacts/
 
-      - name: Upload to GitHub Release
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.name }}
+          path: artifacts/*.zip
+          retention-days: 14
+
+      - name: Publish to GitHub Release
+        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
+          name: Universal Downloader+ ${{ github.ref_name }}
           generate_release_notes: true
-          files: |
-            artifacts/${{ matrix.artifact }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body: |
+            ## Universal Downloader+ ${{ github.ref_name }}
+
+            Standalone builds for Windows, macOS and Linux — FFmpeg is bundled,
+            no separate install required.
+
+            | Platform | Asset |
+            |---|---|
+            | Windows x64 | `UniversalDownloaderPlus-${{ github.ref_name }}-windows-x64.zip` |
+            | macOS arm64 | `UniversalDownloaderPlus-${{ github.ref_name }}-macos-arm64.zip` |
+            | Linux x64   | `UniversalDownloaderPlus-${{ github.ref_name }}-linux-x64.zip` |
+
+            > **Security notice:** these binaries are self-signed / ad-hoc signed.
+            > Windows SmartScreen and macOS Gatekeeper will still warn on first run.
+            > On macOS: `xattr -dr com.apple.quarantine UniversalDownloaderPlus.app`
+          files: artifacts/*.zip

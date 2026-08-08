@@ -25,13 +25,14 @@ import qdarktheme
 
 from PyQt6.QtCore import (Qt, QUrl, QThread, pyqtSignal, QSize,
                           QPropertyAnimation, QEasingCurve, pyqtProperty,
-                          QTimer, QSettings, QStandardPaths)
-from PyQt6.QtGui import QPixmap, QClipboard, QIcon, QPainter, QColor, QBrush, QPen, QDesktopServices
+                          QTimer, QSettings, QStandardPaths, QRectF)
+from PyQt6.QtGui import (QPixmap, QClipboard, QIcon, QPainter, QColor, QBrush,
+                         QPen, QDesktopServices, QPainterPath)
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QDialog, QLabel, QPushButton,
     QLineEdit, QComboBox, QCheckBox, QProgressBar, QFileDialog, QFrame,
     QVBoxLayout, QHBoxLayout, QGridLayout, QStackedWidget, QScrollArea,
-    QSizePolicy, QMessageBox, QToolButton, QSpinBox,
+    QSizePolicy, QMessageBox, QToolButton, QSpinBox, QGraphicsDropShadowEffect,
 )
 from PyQt6.QtNetwork import QNetworkCookie
 from PyQt6.QtWebEngineCore import (
@@ -253,62 +254,387 @@ AD_SKIP_JS = r"""
 GREEN = "#2ea043"
 GREEN_HOVER = "#3fb950"
 
-# Layout/shape-only QSS layered on top of qdarktheme's base colors.
-# Green accent buttons are forced explicitly (central to the 4K aesthetic).
-CUSTOM_QSS = """
-QLineEdit#urlbox { font-size: 14px; padding: 9px 16px; border-radius: 8px; }
-QPushButton#green {
-    background-color: #2ea043; border: none; color: white;
-    font-weight: bold; border-radius: 8px; padding: 7px 16px;
+# ---------------------------------------------------------------------------
+# Design system
+# ---------------------------------------------------------------------------
+# Single source of truth for colour/shape/typography. Both themes share the
+# same geometry; only the palette swaps, so every screen stays consistent.
+
+FONT_STACK = '"Segoe UI", "SF Pro Display", "Inter", sans-serif'
+FONT_MONO = '"Cascadia Mono", "SF Mono", Consolas, monospace'
+
+RADIUS_CARD = 12       # cards, dialogs, surfaces
+RADIUS_INPUT = 8       # inputs, buttons
+RADIUS_PILL = 999      # badges, toggles
+
+ACCENT = "#22c55e"           # emerald-500
+ACCENT_HOVER = "#4ade80"     # emerald-400
+ACCENT_PRESSED = "#16a34a"   # emerald-600
+DANGER = "#ef4444"           # red-500
+DANGER_HOVER = "#f87171"
+INFO = "#60a5fa"             # blue-400
+
+DARK_TOKENS = {
+    "bg": "#18181b",          # zinc-900
+    "surface": "#27272a",     # zinc-800
+    "surface_alt": "#2f2f34",
+    "border": "#3f3f46",      # zinc-700
+    "text": "#fafafa",
+    "text_muted": "#a1a1aa",  # zinc-400
+    "hover": "rgba(255, 255, 255, 0.08)",
+    "pressed": "rgba(255, 255, 255, 0.14)",
+    "scroll": "rgba(161, 161, 170, 0.35)",
+    "scroll_hover": "rgba(212, 212, 216, 0.60)",
 }
-QPushButton#green:hover { background-color: #3fb950; }
-QPushButton#green:pressed { background-color: #26843a; }
-QPushButton#green:disabled { background-color: #21502c; color: gray; }
-QPushButton#danger {
-    background-color: #c93c3c; border: none; color: white;
-    border-radius: 8px; padding: 7px 16px;
+
+LIGHT_TOKENS = {
+    "bg": "#f4f4f5",          # zinc-100
+    "surface": "#ffffff",
+    "surface_alt": "#fafafa",
+    "border": "#d4d4d8",      # zinc-300
+    "text": "#18181b",
+    "text_muted": "#52525b",  # zinc-600
+    "hover": "rgba(24, 24, 27, 0.06)",
+    "pressed": "rgba(24, 24, 27, 0.12)",
+    "scroll": "rgba(82, 82, 91, 0.30)",
+    "scroll_hover": "rgba(63, 63, 70, 0.55)",
 }
-QPushButton#danger:hover { background-color: #e04b4b; }
-QPushButton#navtab {
-    background: transparent; border: none; padding: 8px 16px;
-    font-weight: bold; border-radius: 0;
-}
-QPushButton#navtab:checked { border-bottom: 2px solid #2ea043; }
-QToolButton#mainnav, QToolButton#utilnav {
+
+
+def theme_tokens(dark: bool = True) -> dict:
+    return dict(DARK_TOKENS if dark else LIGHT_TOKENS)
+
+
+def rounded_thumbnail(data: bytes, w: int, h: int, radius: int = 8) -> QPixmap:
+    """Center-cropped, anti-aliased thumbnail clipped to a rounded rect."""
+    src = QPixmap()
+    canvas = QPixmap(w, h)
+    canvas.fill(Qt.GlobalColor.transparent)
+    if not data or not src.loadFromData(data):
+        return canvas
+
+    scaled = src.scaled(w, h,
+                        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                        Qt.TransformationMode.SmoothTransformation)
+    painter = QPainter(canvas)
+    painter.setRenderHints(QPainter.RenderHint.Antialiasing
+                           | QPainter.RenderHint.SmoothPixmapTransform)
+    clip = QPainterPath()
+    clip.addRoundedRect(QRectF(0, 0, w, h), radius, radius)
+    painter.setClipPath(clip)
+    painter.drawPixmap((w - scaled.width()) // 2,
+                       (h - scaled.height()) // 2, scaled)
+    painter.end()
+    return canvas
+
+
+def build_qss(dark: bool = True) -> str:
+    """Compose the full application stylesheet for the given theme."""
+    t = theme_tokens(dark)
+    return f"""
+/* ===================== Base typography & surfaces ===================== */
+* {{
+    font-family: {FONT_STACK};
+    font-size: 13px;
+    font-weight: 400;
+}}
+QMainWindow, QDialog {{
+    background-color: {t['bg']};
+    color: {t['text']};
+}}
+QWidget {{ color: {t['text']}; }}
+QLabel {{ background: transparent; }}
+QLabel#title {{ font-size: 18px; font-weight: 600; }}
+QLabel#sectionHeader {{
+    font-size: 12px; font-weight: 500; color: {t['text_muted']};
+    text-transform: uppercase; letter-spacing: 0.6px;
+}}
+QLabel#subtext {{ font-size: 11px; font-weight: 400; color: {t['text_muted']}; }}
+QToolTip {{
+    background-color: {t['surface']};
+    color: {t['text']};
+    border: 1px solid {t['border']};
+    border-radius: {RADIUS_INPUT}px;
+    padding: 6px 9px;
+}}
+
+/* ============================ Surfaces =============================== */
+QFrame#card, QFrame#downloadCard, QFrame#surface {{
+    background-color: {t['surface']};
+    border: 1px solid {t['border']};
+    border-radius: {RADIUS_CARD}px;
+}}
+QFrame#downloadCard {{ padding: 12px; }}
+QFrame#downloadCard:hover {{ border-color: rgba(34, 197, 94, 0.40); }}
+QFrame#header, QFrame#navbar {{
+    background-color: {t['bg']};
+    border: none;
+    border-bottom: 1px solid {t['border']};
+}}
+QFrame#row {{
+    background-color: {t['surface_alt']};
+    border: 1px solid {t['border']};
+    border-radius: {RADIUS_INPUT}px;
+}}
+QFrame#row:hover {{ border-color: rgba(34, 197, 94, 0.45); }}
+QFrame#divider {{ background-color: {t['border']}; border: none; }}
+
+/* ============================= Inputs ================================ */
+QLineEdit, QComboBox, QSpinBox, QAbstractSpinBox {{
+    background-color: {t['surface']};
+    border: 1px solid {t['border']};
+    border-radius: {RADIUS_INPUT}px;
+    padding: 8px 12px;
+    color: {t['text']};
+    selection-background-color: {ACCENT};
+    selection-color: #ffffff;
+}}
+QLineEdit:hover, QComboBox:hover, QSpinBox:hover {{
+    border-color: {t['text_muted']};
+}}
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus {{
+    border: 1px solid {ACCENT};
+    outline: none;
+}}
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled {{
+    color: {t['text_muted']};
+    background-color: {t['surface_alt']};
+}}
+QLineEdit#urlbox {{ font-size: 14px; padding: 10px 16px; }}
+QLineEdit#addrbar {{
+    font-size: 12px;
+    padding: 7px 14px;
+    border-radius: {RADIUS_PILL}px;
+    background-color: {t['surface_alt']};
+}}
+QComboBox::drop-down {{ border: none; width: 22px; }}
+QComboBox::down-arrow {{ width: 0; height: 0; }}
+QComboBox QAbstractItemView {{
+    background-color: {t['surface']};
+    border: 1px solid {t['border']};
+    border-radius: {RADIUS_INPUT}px;
+    padding: 4px;
+    outline: none;
+    selection-background-color: rgba(34, 197, 94, 0.22);
+    selection-color: {t['text']};
+}}
+QSpinBox::up-button, QSpinBox::down-button {{ width: 16px; border: none; }}
+
+/* ============================ Buttons ================================ */
+QPushButton {{
+    background-color: {t['surface']};
+    border: 1px solid {t['border']};
+    border-radius: {RADIUS_INPUT}px;
+    padding: 8px 16px;
+    font-weight: 500;
+    color: {t['text']};
+}}
+QPushButton:hover {{ background-color: {t['hover']}; border-color: {t['text_muted']}; }}
+QPushButton:pressed {{ background-color: {t['pressed']}; }}
+QPushButton:disabled {{ color: {t['text_muted']}; border-color: {t['border']}; }}
+
+QPushButton#green {{
+    background-color: {ACCENT}; border: none; color: #06240f;
+    font-weight: 600; border-radius: {RADIUS_INPUT}px; padding: 8px 18px;
+}}
+QPushButton#green:hover {{ background-color: {ACCENT_HOVER}; }}
+QPushButton#green:pressed {{ background-color: {ACCENT_PRESSED}; }}
+QPushButton#green:disabled {{ background-color: rgba(34, 197, 94, 0.25); color: {t['text_muted']}; }}
+
+QPushButton#danger {{
+    background-color: {DANGER}; border: none; color: #ffffff;
+    font-weight: 500; border-radius: {RADIUS_INPUT}px; padding: 8px 16px;
+}}
+QPushButton#danger:hover {{ background-color: {DANGER_HOVER}; }}
+
+/* Compact semantic row actions (Show / Delete / Clear) */
+QPushButton#actionShow, QPushButton#actionDelete, QPushButton#actionClear {{
+    border-radius: {RADIUS_INPUT}px;
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 500;
+    text-align: left;
+}}
+QPushButton#actionShow {{
+    background-color: rgba(96, 165, 250, 0.14);
+    border: 1px solid rgba(96, 165, 250, 0.35);
+    color: {INFO};
+}}
+QPushButton#actionShow:hover {{ background-color: rgba(96, 165, 250, 0.26); }}
+QPushButton#actionDelete {{
+    background-color: rgba(239, 68, 68, 0.12);
+    border: 1px solid rgba(239, 68, 68, 0.32);
+    color: {DANGER_HOVER};
+}}
+QPushButton#actionDelete:hover {{ background-color: rgba(239, 68, 68, 0.24); }}
+QPushButton#actionClear {{
+    background-color: {t['hover']};
+    border: 1px solid {t['border']};
+    color: {t['text_muted']};
+}}
+QPushButton#actionClear:hover {{ background-color: {t['pressed']}; color: {t['text']}; }}
+
+/* Segmented filter tabs */
+QPushButton#navtab {{
+    background: transparent; border: 1px solid transparent;
+    padding: 6px 14px; font-weight: 500;
+    border-radius: {RADIUS_PILL}px; color: {t['text_muted']};
+}}
+QPushButton#navtab:hover {{ background-color: {t['hover']}; color: {t['text']}; }}
+QPushButton#navtab:checked {{
+    background-color: rgba(34, 197, 94, 0.16);
+    border-color: rgba(34, 197, 94, 0.45);
+    color: {ACCENT_HOVER};
+    font-weight: 600;
+}}
+
+/* Icon-only navigation + utility buttons */
+QToolButton#mainnav, QToolButton#utilnav, QToolButton#browsernav {{
     background: transparent;
     border: 1px solid transparent;
-    border-radius: 12px;
+    border-radius: {RADIUS_INPUT}px;
     padding: 8px;
     margin: 2px;
-}
-QToolButton#mainnav:hover, QToolButton#utilnav:hover {
-    background-color: rgba(160, 170, 185, 0.14);
-    border-color: rgba(160, 170, 185, 0.22);
-}
-QToolButton#mainnav:pressed, QToolButton#utilnav:pressed {
-    background-color: rgba(160, 170, 185, 0.24);
-}
-QToolButton#mainnav:checked {
-    background-color: rgba(46, 160, 67, 0.16);
-    border-color: rgba(46, 160, 67, 0.45);
-}
-QToolButton#mainnav:checked:hover {
-    background-color: rgba(46, 160, 67, 0.24);
-}
-QToolButton#service {
-    border-radius: 15px; font-size: 14px; font-weight: bold; padding: 12px;
-    border: 1px solid rgba(128, 128, 128, 0.25);
-    background-color: rgba(128, 128, 128, 0.07);
-}
-QToolButton#service:hover {
-    background-color: rgba(128, 128, 128, 0.18);
-    border-color: rgba(128, 128, 128, 0.45);
-}
-QToolButton#service:pressed { background-color: rgba(128, 128, 128, 0.28); }
-QProgressBar { border-radius: 5px; height: 10px; color: transparent; }
-QProgressBar::chunk { background-color: #2ea043; border-radius: 5px; }
-QFrame#card { border-radius: 10px; }
+}}
+QToolButton#mainnav {{ border-radius: {RADIUS_CARD}px; }}
+QToolButton#mainnav:hover, QToolButton#utilnav:hover, QToolButton#browsernav:hover {{
+    background-color: {t['hover']};
+    border-color: {t['border']};
+}}
+QToolButton#mainnav:pressed, QToolButton#utilnav:pressed,
+QToolButton#browsernav:pressed {{ background-color: {t['pressed']}; }}
+QToolButton#mainnav:checked {{
+    background-color: rgba(34, 197, 94, 0.16);
+    border-color: rgba(34, 197, 94, 0.45);
+}}
+QToolButton#mainnav:checked:hover {{ background-color: rgba(34, 197, 94, 0.24); }}
+QToolButton#browsernav:disabled {{ background: transparent; border-color: transparent; }}
+
+/* Floating action button inside the browser */
+QPushButton#fab {{
+    background-color: {ACCENT};
+    border: none;
+    color: #06240f;
+    font-size: 14px;
+    font-weight: 600;
+    border-radius: 24px;
+    padding: 0 26px;
+}}
+QPushButton#fab:hover {{ background-color: {ACCENT_HOVER}; }}
+QPushButton#fab:pressed {{ background-color: {ACCENT_PRESSED}; }}
+
+QToolButton#service {{
+    border-radius: {RADIUS_CARD}px; font-size: 14px; font-weight: 500;
+    padding: 12px;
+    border: 1px solid {t['border']};
+    background-color: {t['surface']};
+    color: {t['text']};
+}}
+QToolButton#service:hover {{
+    background-color: {t['hover']};
+    border-color: rgba(34, 197, 94, 0.45);
+}}
+QToolButton#service:pressed {{ background-color: {t['pressed']}; }}
+
+/* ========================= Status badges ============================= */
+QLabel#badge {{
+    border-radius: {RADIUS_PILL}px;
+    padding: 3px 10px;
+    font-size: 11px;
+    font-weight: 600;
+}}
+QLabel#badgeQueued {{
+    background-color: {t['hover']}; color: {t['text_muted']};
+    border: 1px solid {t['border']};
+}}
+QLabel#badgeActive {{
+    background-color: rgba(96, 165, 250, 0.16); color: {INFO};
+    border: 1px solid rgba(96, 165, 250, 0.38);
+}}
+QLabel#badgeDone {{
+    background-color: rgba(34, 197, 94, 0.16); color: {ACCENT_HOVER};
+    border: 1px solid rgba(34, 197, 94, 0.40);
+}}
+QLabel#badgeError {{
+    background-color: rgba(239, 68, 68, 0.14); color: {DANGER_HOVER};
+    border: 1px solid rgba(239, 68, 68, 0.36);
+}}
+QLabel#badgeRecommended {{
+    background-color: rgba(34, 197, 94, 0.18);
+    color: {ACCENT_HOVER};
+    border: 1px solid rgba(34, 197, 94, 0.55);
+    border-radius: {RADIUS_PILL}px;
+    padding: 2px 9px;
+    font-size: 10px;
+    font-weight: 600;
+}}
+
+/* ========================== Progress bars ============================ */
+QProgressBar {{
+    background-color: {t['border']};
+    border: none;
+    border-radius: 4px;
+    max-height: 8px;
+    min-height: 8px;
+    color: transparent;
+    text-align: center;
+}}
+QProgressBar::chunk {{ background-color: {ACCENT}; border-radius: 4px; }}
+
+/* =========================== Checkboxes ============================== */
+QCheckBox {{ spacing: 10px; background: transparent; }}
+QCheckBox::indicator {{
+    width: 18px; height: 18px;
+    border-radius: 6px;
+    border: 1px solid {t['border']};
+    background-color: {t['surface']};
+}}
+QCheckBox::indicator:hover {{ border-color: {ACCENT}; }}
+QCheckBox::indicator:checked {{
+    background-color: {ACCENT};
+    border-color: {ACCENT};
+    image: none;
+}}
+
+/* =========================== Scrollbars ============================== */
+QScrollArea {{ background: transparent; border: none; }}
+QScrollBar:vertical {{
+    background: transparent;
+    width: 6px;
+    margin: 2px 2px 2px 0;
+}}
+QScrollBar::handle:vertical {{
+    background: {t['scroll']};
+    border-radius: 3px;
+    min-height: 32px;
+}}
+QScrollBar::handle:vertical:hover {{ background: {t['scroll_hover']}; }}
+QScrollBar:horizontal {{
+    background: transparent;
+    height: 6px;
+    margin: 0 2px 2px 2px;
+}}
+QScrollBar::handle:horizontal {{
+    background: {t['scroll']};
+    border-radius: 3px;
+    min-width: 32px;
+}}
+QScrollBar::handle:horizontal:hover {{ background: {t['scroll_hover']}; }}
+QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; border: none; }}
+QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
+
+/* ============================ Statusbar ============================== */
+QStatusBar {{
+    background-color: {t['bg']};
+    border-top: 1px solid {t['border']};
+    color: {t['text_muted']};
+}}
+QStatusBar::item {{ border: none; }}
 """
+
+
+# Kept for backwards compatibility with existing call sites.
+CUSTOM_QSS = build_qss(True)
 
 
 # ============================================================================
@@ -717,46 +1043,71 @@ class DownloadModal(QDialog):
         self.fmt_checkboxes = []       # QCheckBox instances
 
         self.setWindowTitle("Download")
-        self.setMinimumSize(640, 620)
+        self.setMinimumSize(720, 660)
         self._build_ui(thumb)
         self._repopulate_formats()
 
     def _build_ui(self, thumb: bytes):
         root = QVBoxLayout(self)
-        root.setSpacing(10)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(14)
 
-        # --- Header: thumbnail + title + duration ---
-        head = QHBoxLayout()
+        # --- Title header: icon + text ---
+        title_bar = QHBoxLayout()
+        title_bar.setSpacing(10)
+        icon_lab = QLabel()
+        icon_lab.setPixmap(
+            safe_icon("fa5s.photo-video", ACCENT).pixmap(QSize(22, 22)))
+        title_bar.addWidget(icon_lab)
+        heading = QLabel("Choose a format")
+        heading.setObjectName("title")
+        title_bar.addWidget(heading)
+        title_bar.addStretch()
+        root.addLayout(title_bar)
+
+        # --- Header card: thumbnail + title + duration ---
+        head_card = QFrame()
+        head_card.setObjectName("card")
+        head = QHBoxLayout(head_card)
+        head.setContentsMargins(14, 14, 14, 14)
+        head.setSpacing(14)
+
         self.thumb_label = QLabel()
         self.thumb_label.setFixedSize(200, 112)
+        self.thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.thumb_label.setStyleSheet(
-            "background-color: rgba(128,128,128,0.15); border-radius: 8px;")
-        self.thumb_label.setScaledContents(True)
+            "background-color: rgba(128,128,128,0.14);"
+            " border-radius: 8px; border: none;")
         if thumb:
-            pix = QPixmap()
-            pix.loadFromData(thumb)
-            self.thumb_label.setPixmap(pix)
+            self.thumb_label.setPixmap(
+                rounded_thumbnail(thumb, 200, 112, radius=8))
         head.addWidget(self.thumb_label)
 
         meta_col = QVBoxLayout()
+        meta_col.setSpacing(6)
         title = self.info.get("title") or self.display.get("title", "Unknown")
         if self.info.get("_type") == "playlist":
             count = len([e for e in self.info.get("entries") or [] if e])
             title = f"[Playlist · {count} videos] {title}"
         t = QLabel(title)
         t.setWordWrap(True)
-        t.setStyleSheet("font-size: 15px; font-weight: bold;")
+        t.setStyleSheet("font-size: 15px; font-weight: 600;")
         meta_col.addWidget(t)
         dur = QLabel("Duration: " + human_duration(self.display.get("duration")))
-        dur.setStyleSheet("color: gray;")
+        dur.setObjectName("subtext")
         meta_col.addWidget(dur)
         meta_col.addStretch()
         head.addLayout(meta_col, 1)
-        root.addLayout(head)
+        root.addWidget(head_card)
 
         # --- Option dropdown grid ---
+        opts_header = QLabel("Filters")
+        opts_header.setObjectName("sectionHeader")
+        root.addWidget(opts_header)
+
         grid = QGridLayout()
         grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(5)
 
         self.type_combo = QComboBox()
         self.type_combo.addItems(["Video", "Audio"])
@@ -785,37 +1136,52 @@ class DownloadModal(QDialog):
         self.fps_combo.currentTextChanged.connect(self._repopulate_formats)
         root.addLayout(grid)
 
-        # --- Format checkbox list ---
+        # --- Format list ---
+        fmt_header = QLabel("Available formats")
+        fmt_header.setObjectName("sectionHeader")
+        root.addWidget(fmt_header)
+
         self.fmt_scroll = QScrollArea()
         self.fmt_scroll.setWidgetResizable(True)
+        self.fmt_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.fmt_container = QWidget()
         self.fmt_layout = QVBoxLayout(self.fmt_container)
-        self.fmt_layout.setSpacing(2)
+        self.fmt_layout.setContentsMargins(0, 0, 6, 0)
+        self.fmt_layout.setSpacing(6)
         self.fmt_layout.addStretch()
         self.fmt_scroll.setWidget(self.fmt_container)
         root.addWidget(self.fmt_scroll, 1)
 
-        # --- Action buttons ---
+        # --- Bottom action bar ---
         actions = QHBoxLayout()
+        actions.setSpacing(10)
         actions.addStretch()
+
         cancel_btn = QPushButton("Cancel")
+        cancel_btn.setMinimumSize(120, 40)
+        cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         cancel_btn.clicked.connect(self.reject)
-        dl_btn = QPushButton("Download")
-        dl_btn.setObjectName("green")
-        dl_btn.setMinimumWidth(140)
-        dl_btn.clicked.connect(self._accept_download)
         actions.addWidget(cancel_btn)
+
+        dl_btn = QPushButton("  Download")
+        dl_btn.setObjectName("green")
+        dl_btn.setIcon(safe_icon("fa5s.download", "#06240f"))
+        dl_btn.setIconSize(QSize(15, 15))
+        dl_btn.setMinimumSize(160, 40)
+        dl_btn.setDefault(True)
+        dl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        dl_btn.clicked.connect(self._accept_download)
         actions.addWidget(dl_btn)
         root.addLayout(actions)
 
     # -- format list -------------------------------------------------------
     def _clear_formats(self):
-        for cb in self.fmt_checkboxes:
-            cb.deleteLater()
+        # Rows own their checkboxes, so dropping the row frames is enough.
         self.fmt_checkboxes.clear()
         while self.fmt_layout.count() > 1:
             item = self.fmt_layout.takeAt(0)
             if item.widget():
+                item.widget().hide()
                 item.widget().deleteLater()
 
     def _best_audio_size(self) -> int:
@@ -904,17 +1270,40 @@ class DownloadModal(QDialog):
         for _, label, f in rows[:24]:
             is_rec = (recommended is not None
                       and f.get("format_id") == recommended.get("format_id"))
-            display_label = f"  {label}  (⭐ Recommended)" if is_rec else label
-            cb = QCheckBox(display_label)
-            cb.setStyleSheet("font-family: Consolas, monospace;")
-            cb.setProperty("fmt", f)
-            if is_rec:
-                cb.setChecked(True)
-                cb.setStyleSheet(
-                    "font-family: Consolas, monospace;"
-                    " color: #3fb950; font-weight: bold;")
-            self.fmt_checkboxes.append(cb)
-            self.fmt_layout.insertWidget(self.fmt_layout.count() - 1, cb)
+            row = self._make_format_row(label, f, is_rec)
+            self.fmt_layout.insertWidget(self.fmt_layout.count() - 1, row)
+
+    def _make_format_row(self, label: str, fmt: dict,
+                         is_rec: bool) -> QFrame:
+        """One elevated row card: styled checkbox + optional recommended badge."""
+        row = QFrame()
+        row.setObjectName("row")
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(12, 9, 12, 9)
+        lay.setSpacing(10)
+
+        cb = QCheckBox(label)
+        cb.setProperty("fmt", fmt)
+        cb.setCursor(Qt.CursorShape.PointingHandCursor)
+        cb.setStyleSheet(
+            f"font-family: {FONT_MONO}; font-size: 12px;"
+            + (f" color: {ACCENT_HOVER}; font-weight: 600;" if is_rec else ""))
+        if is_rec:
+            cb.setChecked(True)
+        lay.addWidget(cb, 1)
+
+        if is_rec:
+            badge = QLabel("⭐ Recommended")
+            badge.setObjectName("badgeRecommended")
+            glow = QGraphicsDropShadowEffect(badge)
+            glow.setBlurRadius(18)
+            glow.setOffset(0, 0)
+            glow.setColor(QColor(34, 197, 94, 190))
+            badge.setGraphicsEffect(glow)
+            lay.addWidget(badge, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self.fmt_checkboxes.append(cb)
+        return row
 
     # -- accept ------------------------------------------------------------
     def _accept_download(self):
@@ -987,60 +1376,87 @@ class DownloadModal(QDialog):
 # ============================================================================
 
 class DownloadItem(QFrame):
+    THUMB_W, THUMB_H = 120, 68
+
     def __init__(self, title: str, meta: str, thumb: bytes, kind: str,
                  worker: DownloadWorker):
         super().__init__()
-        self.setObjectName("card")
+        self.setObjectName("downloadCard")
         self.kind = kind
         self.worker = worker
         self.file_path = ""
 
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(14)
 
         self.thumb_label = QLabel()
-        self.thumb_label.setFixedSize(120, 68)
-        self.thumb_label.setScaledContents(True)
+        self.thumb_label.setFixedSize(self.THUMB_W, self.THUMB_H)
+        self.thumb_label.setScaledContents(False)
+        self.thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.thumb_label.setStyleSheet(
-            "background-color: rgba(128,128,128,0.15); border-radius: 6px;")
-        lay.addWidget(self.thumb_label)
+            "background-color: rgba(128,128,128,0.14);"
+            " border-radius: 8px; border: none;")
+        lay.addWidget(self.thumb_label, 0, Qt.AlignmentFlag.AlignTop)
 
         mid = QVBoxLayout()
+        mid.setSpacing(7)
+
+        # Title row: title + status badge
+        title_row = QHBoxLayout()
+        title_row.setSpacing(10)
         self.title_label = QLabel(title)
-        self.title_label.setStyleSheet("font-weight: bold;")
+        self.title_label.setStyleSheet("font-size: 13px; font-weight: 600;")
         self.title_label.setWordWrap(True)
-        mid.addWidget(self.title_label)
+        title_row.addWidget(self.title_label, 1)
+
+        self.badge = QLabel("Queued")
+        self.badge.setObjectName("badgeQueued")
+        self.badge.setProperty("class", "badge")
+        self.badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_row.addWidget(self.badge, 0, Qt.AlignmentFlag.AlignTop)
+        mid.addLayout(title_row)
 
         self.meta_label = QLabel(meta)
-        self.meta_label.setStyleSheet("color: gray; font-size: 11px;")
+        self.meta_label.setObjectName("subtext")
         mid.addWidget(self.meta_label)
 
         # Progress bar + live speed label on one row
         pbar_row = QHBoxLayout()
-        pbar_row.setSpacing(8)
+        pbar_row.setSpacing(10)
         self.bar = QProgressBar()
         self.bar.setRange(0, 1000)
         self.bar.setValue(0)
+        self.bar.setTextVisible(False)
         self.bar.setFixedHeight(8)
         pbar_row.addWidget(self.bar, 1)
         self.speed_label = QLabel("")
+        self.speed_label.setObjectName("subtext")
         self.speed_label.setFixedWidth(150)
-        self.speed_label.setStyleSheet("color: gray; font-size: 11px;")
+        self.speed_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         pbar_row.addWidget(self.speed_label)
         mid.addLayout(pbar_row)
 
         self.stat_label = QLabel("Queued...")
-        self.stat_label.setStyleSheet("color: gray; font-size: 11px;")
+        self.stat_label.setObjectName("subtext")
         mid.addWidget(self.stat_label)
         lay.addLayout(mid, 1)
 
         self.btns_layout = QVBoxLayout()
-        self.pause_btn = QPushButton("Pause")
-        self.pause_btn.setFixedWidth(90)
+        self.btns_layout.setSpacing(6)
+        self.btns_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.pause_btn = QPushButton("  Pause")
+        self.pause_btn.setIcon(safe_icon("fa5s.pause", "#a1a1aa"))
+        self.pause_btn.setObjectName("actionClear")
+        self.pause_btn.setFixedWidth(112)
+        self.pause_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.pause_btn.clicked.connect(self.toggle_pause)
-        self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.setObjectName("danger")
-        self.cancel_btn.setFixedWidth(90)
+        self.cancel_btn = QPushButton("  Cancel")
+        self.cancel_btn.setIcon(safe_icon("fa5s.times", "#f87171"))
+        self.cancel_btn.setObjectName("actionDelete")
+        self.cancel_btn.setFixedWidth(112)
+        self.cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.cancel_btn.clicked.connect(self.cancel)
         self.btns_layout.addWidget(self.pause_btn)
         self.btns_layout.addWidget(self.cancel_btn)
@@ -1054,53 +1470,61 @@ class DownloadItem(QFrame):
         if thumb:
             self._set_cropped_thumbnail(thumb)
 
+    # -- status badge ------------------------------------------------------
+    def set_badge(self, text: str, state: str):
+        """state: queued | active | done | error — drives the pill tint."""
+        self.badge.setText(text)
+        self.badge.setObjectName({
+            "queued": "badgeQueued",
+            "active": "badgeActive",
+            "done": "badgeDone",
+            "error": "badgeError",
+        }.get(state, "badgeQueued"))
+        # Re-evaluate the stylesheet now the objectName changed.
+        self.badge.style().unpolish(self.badge)
+        self.badge.style().polish(self.badge)
+
     # -- thumbnail (async bytes -> square, centered crop) ---------------
     def on_thumbnail_ready(self, data: bytes):
         if data:
             self._set_cropped_thumbnail(data)
 
     def _set_cropped_thumbnail(self, data: bytes):
-        """Scale with expanding aspect ratio, then center-crop into the box
-        via a QPainter so the image fills the thumb square without stretch."""
-        pix = QPixmap()
-        if not data or not pix.loadFromData(data):
+        """Center-crop into a rounded frame with anti-aliased smooth scaling."""
+        if not data:
             return
-        w, h = 120, 68
-        scaled = pix.scaled(w, h,
-                            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                            Qt.TransformationMode.SmoothTransformation)
-        canvas = QPixmap(w, h)
-        canvas.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(canvas)
-        x = (w - scaled.width()) // 2
-        y = (h - scaled.height()) // 2
-        painter.drawPixmap(x, y, scaled)
-        painter.end()
         self.thumb_label.setScaledContents(False)
-        self.thumb_label.setPixmap(canvas)
+        self.thumb_label.setPixmap(
+            rounded_thumbnail(data, self.THUMB_W, self.THUMB_H, radius=8))
 
     # -- progress --------------------------------------------------------
     def on_progress_update(self, percent: float, speed: str):
         self.bar.setValue(int(percent * 10))   # 0-1000
         if speed:
-            self.speed_label.setText(f"Downloading... {speed}")
+            self.speed_label.setText(speed)
+            self.set_badge("Downloading", "active")
         elif self.bar.value() >= 1000:
             self.speed_label.setText("Done")
 
     def toggle_pause(self):
         self.worker.is_paused = not self.worker.is_paused
         if self.worker.is_paused:
-            self.pause_btn.setText("Resume")
+            self.pause_btn.setText("  Resume")
+            self.pause_btn.setIcon(safe_icon("fa5s.play", "#a1a1aa"))
             self.stat_label.setText("Paused")
+            self.set_badge("Paused", "queued")
         else:
-            self.pause_btn.setText("Pause")
+            self.pause_btn.setText("  Pause")
+            self.pause_btn.setIcon(safe_icon("fa5s.pause", "#a1a1aa"))
             self.stat_label.setText("Resuming...")
+            self.set_badge("Downloading", "active")
 
     def cancel(self):
         self.worker.is_cancelled = True
         self.worker.is_paused = False
         self.stat_label.setText("Cancelling...")
-        self.speed_label.setText("Canceled")
+        self.speed_label.setText("")
+        self.set_badge("Canceled", "error")
         self._hide_ctrl_buttons()
         self._inject_remove_button()
 
@@ -1108,17 +1532,27 @@ class DownloadItem(QFrame):
         self.pause_btn.hide()
         self.cancel_btn.hide()
 
+    @staticmethod
+    def _row_action(text: str, icon: str, color: str, obj: str,
+                    slot, tip: str = "") -> QPushButton:
+        """Compact icon + text action button with a semantic tint."""
+        b = QPushButton("  " + text)
+        b.setIcon(safe_icon(icon, color))
+        b.setIconSize(QSize(13, 13))
+        b.setObjectName(obj)
+        b.setFixedWidth(112)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        if tip:
+            b.setToolTip(tip)
+        b.clicked.connect(slot)
+        return b
+
     def _inject_remove_button(self):
         if getattr(self, "_remove_btn", None) is not None:
             return
-        self._remove_btn = QPushButton("  Remove")
-        self._remove_btn.setIcon(qta.icon("fa5s.trash", color="#e6edf3"))
-        self._remove_btn.setFixedWidth(110)
-        self._remove_btn.setStyleSheet(
-            "background-color: #30363d; border: none; color: #e6edf3;"
-            "border-radius: 6px; padding: 6px 10px;")
-        self._remove_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._remove_btn.clicked.connect(self._remove_from_list)
+        self._remove_btn = self._row_action(
+            "Remove", "fa5s.trash", "#a1a1aa", "actionClear",
+            self._remove_from_list, "Remove this row from the list")
         self.btns_layout.addWidget(self._remove_btn)
 
     def on_progress(self, d: dict):
@@ -1141,51 +1575,40 @@ class DownloadItem(QFrame):
 
         if ok:
             self.bar.setValue(1000)
-            self.speed_label.setText("Done")
-            self.stat_label.setText("✅ " + msg)
+            self.speed_label.setText("")
+            self.set_badge("Completed", "done")
+            self.stat_label.setText(msg)
             self.stat_label.setStyleSheet(
-                "color: #3fb950; font-size: 11px; font-weight: bold;")
+                f"color: {ACCENT_HOVER}; font-size: 11px; font-weight: 500;")
             self._swap_buttons_success()
         else:
             self.pause_btn.setEnabled(False)
             self.cancel_btn.setEnabled(False)
             self._hide_ctrl_buttons()
             self._inject_remove_button()
-            self.stat_label.setText("❌ " + msg)
-            self.stat_label.setStyleSheet("color: #ff5555; font-size: 11px;")
+            cancelled = msg.strip().lower().startswith("cancel")
+            self.set_badge("Canceled" if cancelled else "Failed", "error")
+            self.stat_label.setText(msg)
+            self.stat_label.setStyleSheet(
+                f"color: {DANGER_HOVER}; font-size: 11px;")
 
     def _swap_buttons_success(self):
         self.pause_btn.hide()
         self.cancel_btn.hide()
 
-        self.show_btn = QPushButton("  Show File")
-        self.show_btn.setIcon(qta.icon("fa5s.folder-open", color="#e6edf3"))
-        self.show_btn.setFixedWidth(110)
-        self.show_btn.setStyleSheet(
-            "background-color: #30363d; border: none; color: #e6edf3;"
-            "border-radius: 6px; padding: 6px 10px;")
-        self.show_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.show_btn.clicked.connect(self.show_file)
+        self.show_btn = self._row_action(
+            "Show File", "fa5s.folder-open", INFO, "actionShow",
+            self.show_file, "Reveal the file in your file manager")
         self.btns_layout.addWidget(self.show_btn)
 
-        self.delete_btn = QPushButton("  Delete")
-        self.delete_btn.setIcon(qta.icon("fa5s.trash", color="#ffffff"))
-        self.delete_btn.setFixedWidth(110)
-        self.delete_btn.setObjectName("danger")
-        self.delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.delete_btn.clicked.connect(self.delete_file)
+        self.delete_btn = self._row_action(
+            "Delete", "fa5s.trash", DANGER_HOVER, "actionDelete",
+            self.delete_file, "Delete the file from disk")
         self.btns_layout.addWidget(self.delete_btn)
 
-        self.clear_btn = QPushButton("  Clear")
-        self.clear_btn.setIcon(qta.icon("fa5s.eraser", color="#9aa4b2"))
-        self.clear_btn.setFixedWidth(110)
-        self.clear_btn.setStyleSheet(
-            "background-color: #3d444d; border: none; color: #e6edf3;"
-            "border-radius: 6px; padding: 6px 10px;")
-        self.clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.clear_btn.setToolTip(
-            "Remove from the list (keeps the file on disk)")
-        self.clear_btn.clicked.connect(self.deleteLater)
+        self.clear_btn = self._row_action(
+            "Clear", "fa5s.eraser", "#a1a1aa", "actionClear",
+            self.deleteLater, "Remove from the list (keeps the file on disk)")
         self.btns_layout.addWidget(self.clear_btn)
 
     def show_file(self):
@@ -1289,10 +1712,13 @@ class BrowserPage(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
-        # Nav bar
-        nav = QHBoxLayout()
-        nav.setContentsMargins(8, 8, 8, 8)
-        nav.setSpacing(6)
+        # --- Compact navigation bar ---
+        navbar = QFrame()
+        navbar.setObjectName("navbar")
+        nav = QHBoxLayout(navbar)
+        nav.setContentsMargins(10, 8, 10, 8)
+        nav.setSpacing(4)
+
         self.back_btn = QToolButton()
         self.fwd_btn = QToolButton()
         self.reload_btn = QToolButton()
@@ -1300,34 +1726,45 @@ class BrowserPage(QWidget):
         nav_buttons = (
             (self.back_btn, "fa5s.arrow-left", "Back"),
             (self.fwd_btn, "fa5s.arrow-right", "Forward"),
-            (self.reload_btn, "fa5s.redo", "Reload"),
+            (self.reload_btn, "fa5s.redo", "Refresh"),
             (self.home_btn, "fa5s.home", "Home"),
         )
         for btn, icon, tip in nav_buttons:
-            btn.setIcon(safe_icon(icon, "#c9d1d9"))
-            btn.setIconSize(QSize(14, 14))
+            btn.setObjectName("browsernav")
+            btn.setAutoRaise(True)
+            btn.setIcon(safe_icon(icon, "#a1a1aa"))
+            btn.setIconSize(QSize(16, 16))
             btn.setToolTip(tip)
-            btn.setFixedSize(32, 30)
-            btn.setStyleSheet(
-                "background: transparent; border: none; border-radius: 6px;"
-                " color: #c9d1d9;")
+            btn.setFixedSize(34, 34)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             nav.addWidget(btn)
-        nav.addSpacing(4)
+        nav.addSpacing(6)
 
         self.addr = QLineEdit()
-        self.addr.setPlaceholderText("Enter URL or search...")
+        self.addr.setObjectName("addrbar")
+        self.addr.setPlaceholderText("Search Google or enter a URL...")
+        self.addr.setClearButtonEnabled(True)
+        self.addr.setMinimumHeight(34)
         nav.addWidget(self.addr, 1)
-        lay.addLayout(nav)
+        lay.addWidget(navbar)
 
         self.view = QWebEngineView(profile, self)
         self.browser = self.view
         lay.addWidget(self.view, 1)
 
-        # Floating download button
-        self.dl_btn = QPushButton("⬇  Download", self)
-        self.dl_btn.setObjectName("green")
-        self.dl_btn.setFixedSize(180, 44)
+        # --- Floating action button (FAB) ---
+        self.dl_btn = QPushButton("  Download", self)
+        self.dl_btn.setObjectName("fab")
+        self.dl_btn.setIcon(safe_icon("fa5s.arrow-circle-down", "#06240f"))
+        self.dl_btn.setIconSize(QSize(20, 20))
+        self.dl_btn.setFixedSize(188, 48)
+        self.dl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.dl_btn.setToolTip("Download the media on this page")
+        shadow = QGraphicsDropShadowEffect(self.dl_btn)
+        shadow.setBlurRadius(28)
+        shadow.setOffset(0, 6)
+        shadow.setColor(QColor(0, 0, 0, 170))
+        self.dl_btn.setGraphicsEffect(shadow)
         self.dl_btn.hide()
         self.dl_btn.clicked.connect(self.on_download_clicked)
 
@@ -1379,7 +1816,7 @@ class BrowserPage(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.dl_btn.move((self.width() - self.dl_btn.width()) // 2,
-                         self.height() - self.dl_btn.height() - 24)
+                         self.height() - self.dl_btn.height() - 28)
 
 
 class DownloadsPage(QWidget):
@@ -1512,91 +1949,97 @@ class SettingsModal(QDialog):
         self.values = dict(values)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(22, 20, 22, 18)
-        root.setSpacing(16)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(14)
 
+        # --- Title header ---
+        title_bar = QHBoxLayout()
+        title_bar.setSpacing(10)
+        icon_lab = QLabel()
+        icon_lab.setPixmap(
+            safe_icon("fa5s.sliders-h", ACCENT).pixmap(QSize(22, 22)))
+        title_bar.addWidget(icon_lab)
+        head_col = QVBoxLayout()
+        head_col.setSpacing(2)
         title = QLabel("Settings")
-        title.setStyleSheet("font-size: 18px; font-weight: bold;")
-        root.addWidget(title)
-
+        title.setObjectName("title")
+        head_col.addWidget(title)
         subtitle = QLabel("Preferences are saved and restored on next launch.")
-        subtitle.setStyleSheet("color: gray; font-size: 11px;")
-        root.addWidget(subtitle)
+        subtitle.setObjectName("subtext")
+        head_col.addWidget(subtitle)
+        title_bar.addLayout(head_col)
+        title_bar.addStretch()
+        root.addLayout(title_bar)
 
-        card = QFrame()
-        card.setObjectName("card")
-        form = QGridLayout(card)
-        form.setContentsMargins(16, 16, 16, 16)
-        form.setHorizontalSpacing(12)
-        form.setVerticalSpacing(14)
-        form.setColumnStretch(1, 1)
-
-        # --- Download directory -----------------------------------------
-        form.addWidget(self._label("Download Directory"), 0, 0)
+        # --- Section: Storage Preferences ---
+        storage, sform = self._section("Storage Preferences", root)
+        sform.addWidget(self._label("Download Directory"), 0, 0)
         self.dir_edit = QLineEdit(self.values["download_dir"])
-        self.dir_edit.setMinimumHeight(34)
+        self.dir_edit.setMinimumHeight(36)
         self.dir_edit.setPlaceholderText("Where finished files are saved")
-        form.addWidget(self.dir_edit, 0, 1)
+        sform.addWidget(self.dir_edit, 0, 1)
 
         self.browse_btn = QPushButton("  Browse")
-        self.browse_btn.setIcon(qta.icon("fa5s.folder-open", color="#e6edf3"))
-        self.browse_btn.setMinimumHeight(34)
-        self.browse_btn.setFixedWidth(110)
+        self.browse_btn.setIcon(safe_icon("fa5s.folder-open", "#a1a1aa"))
+        self.browse_btn.setMinimumHeight(36)
+        self.browse_btn.setFixedWidth(118)
         self.browse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.browse_btn.clicked.connect(self.browse_dir)
-        form.addWidget(self.browse_btn, 0, 2)
+        sform.addWidget(self.browse_btn, 0, 2)
 
-        # --- Max concurrent downloads -------------------------------------
-        form.addWidget(self._label("Max Concurrent Downloads"), 1, 0)
+        # --- Section: Download Limits ---
+        limits, lform = self._section("Download Limits", root)
+        lform.addWidget(self._label("Max Concurrent Downloads"), 0, 0)
         self.concurrent_spin = QSpinBox()
         self.concurrent_spin.setRange(1, 10)
         self.concurrent_spin.setValue(self.values["max_concurrent_downloads"])
-        self.concurrent_spin.setMinimumHeight(34)
+        self.concurrent_spin.setMinimumHeight(36)
         self.concurrent_spin.setToolTip(
             "Extra downloads beyond this limit wait in the queue.")
-        form.addWidget(self.concurrent_spin, 1, 1, 1, 2)
+        lform.addWidget(self.concurrent_spin, 0, 1, 1, 2)
 
-        # --- Default format -----------------------------------------------
-        form.addWidget(self._label("Default Format"), 2, 0)
+        lform.addWidget(self._label("Default Format"), 1, 0)
         self.format_combo = QComboBox()
         self.format_combo.addItems(FORMAT_CHOICES)
         self.format_combo.setCurrentText(self.values["preferred_format"])
-        self.format_combo.setMinimumHeight(34)
+        self.format_combo.setMinimumHeight(36)
         self.format_combo.setToolTip(
             "\"Always Ask\" opens the format dialog for every download.")
-        form.addWidget(self.format_combo, 2, 1, 1, 2)
+        lform.addWidget(self.format_combo, 1, 1, 1, 2)
 
-        # --- Theme -----------------------------------------------------------
-        form.addWidget(self._label("Theme"), 3, 0)
+        # --- Section: Theme ---
+        theme_card, tform = self._section("Theme", root)
+        tform.addWidget(self._label("Appearance"), 0, 0)
         self.theme_combo = QComboBox()
         self.theme_combo.addItems(THEME_CHOICES)          # ["Dark", "Light"]
-        self.theme_combo.setCurrentText(
-            self.values["theme"].capitalize())
-        self.theme_combo.setMinimumHeight(34)
+        self.theme_combo.setCurrentText(self.values["theme"].capitalize())
+        self.theme_combo.setMinimumHeight(36)
         self.theme_combo.setToolTip("Applied immediately after saving.")
-        form.addWidget(self.theme_combo, 3, 1, 1, 2)
+        tform.addWidget(self.theme_combo, 0, 1, 1, 2)
 
-        root.addWidget(card)
+        root.addStretch()
 
         info = QLabel(f"ffmpeg: {FFMPEG_DIR}")
-        info.setStyleSheet("color: gray; font-size: 10px;")
+        info.setObjectName("subtext")
         info.setWordWrap(True)
         root.addWidget(info)
 
         # --- Buttons --------------------------------------------------------
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
         btn_row.addStretch()
 
         self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.setMinimumSize(110, 38)
+        self.cancel_btn.setMinimumSize(120, 40)
         self.cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.cancel_btn.clicked.connect(self.reject)
         btn_row.addWidget(self.cancel_btn)
 
         self.save_btn = QPushButton("  Save")
         self.save_btn.setObjectName("green")
-        self.save_btn.setIcon(qta.icon("fa5s.check", color="white"))
-        self.save_btn.setMinimumSize(120, 38)
+        self.save_btn.setIcon(safe_icon("fa5s.check", "#06240f"))
+        self.save_btn.setIconSize(QSize(14, 14))
+        self.save_btn.setMinimumSize(140, 40)
         self.save_btn.setDefault(True)
         self.save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.save_btn.clicked.connect(self.on_save)
@@ -1605,9 +2048,29 @@ class SettingsModal(QDialog):
         root.addLayout(btn_row)
 
     @staticmethod
+    def _section(title: str, parent_layout) -> tuple:
+        """Titled card group; returns (card, grid) with aligned columns."""
+        header = QLabel(title)
+        header.setObjectName("sectionHeader")
+        parent_layout.addWidget(header)
+
+        card = QFrame()
+        card.setObjectName("card")
+        grid = QGridLayout(card)
+        grid.setContentsMargins(16, 16, 16, 16)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(12)
+        grid.setColumnMinimumWidth(0, 190)
+        grid.setColumnStretch(1, 1)
+        parent_layout.addWidget(card)
+        return card, grid
+
+    @staticmethod
     def _label(text: str) -> QLabel:
         lab = QLabel(text)
-        lab.setStyleSheet("font-size: 12px;")
+        lab.setStyleSheet("font-size: 12px; font-weight: 500;")
+        lab.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         return lab
 
     def browse_dir(self):
@@ -1758,6 +2221,7 @@ class MainWindow(QMainWindow):
 
         # ================= Header =================
         header = QFrame()
+        header.setObjectName("header")
         header_col = QVBoxLayout(header)
         header_col.setContentsMargins(16, 14, 16, 14)
         header_col.setSpacing(12)
@@ -1967,13 +2431,14 @@ class MainWindow(QMainWindow):
             f"{'Dark' if self.dark else 'Light'} mode enabled.")
 
     def apply_theme(self):
-        """Switch qdarktheme dynamically; keep custom layout/green QSS."""
+        """Switch qdarktheme dynamically; layer the design-system QSS on top."""
         qdarktheme.setup_theme(
             "dark" if self.dark else "light",
-            additional_qss=CUSTOM_QSS,
+            additional_qss=build_qss(self.dark),
         )
-        fg = "#e6edf3" if self.dark else "#1f2328"
-        util_fg = "#c9d1d9" if self.dark else "#57606a"
+        t = theme_tokens(self.dark)
+        fg = t["text"]
+        util_fg = t["text_muted"]
 
         # Moon while in dark mode, sun while in light mode.
         self.theme_btn.setIcon(
@@ -2423,7 +2888,9 @@ def main():
         app.setWindowIcon(QIcon(app_icon_path))
 
     # Honour the persisted theme before the first paint.
-    qdarktheme.setup_theme(load_settings()["theme"], additional_qss=CUSTOM_QSS)
+    saved_theme = load_settings()["theme"]
+    qdarktheme.setup_theme(saved_theme,
+                           additional_qss=build_qss(saved_theme == "dark"))
     win = MainWindow()
     win.apply_theme()  # sync icons/tooltips with the saved theme
 

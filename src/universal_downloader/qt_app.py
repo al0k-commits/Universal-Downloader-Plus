@@ -23,14 +23,17 @@ import yt_dlp
 import qtawesome as qta
 import qdarktheme
 
-from PyQt6.QtCore import Qt, QUrl, QThread, pyqtSignal, QSize, QPropertyAnimation, QEasingCurve, pyqtProperty, QTimer
+from PyQt6.QtCore import (Qt, QUrl, QThread, pyqtSignal, QSize,
+                          QPropertyAnimation, QEasingCurve, pyqtProperty,
+                          QTimer, QSettings, QStandardPaths)
 from PyQt6.QtGui import QPixmap, QClipboard, QIcon, QPainter, QColor, QBrush, QPen, QDesktopServices
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QDialog, QLabel, QPushButton,
     QLineEdit, QComboBox, QCheckBox, QProgressBar, QFileDialog, QFrame,
     QVBoxLayout, QHBoxLayout, QGridLayout, QStackedWidget, QScrollArea,
-    QSizePolicy, QMessageBox, QToolButton,
+    QSizePolicy, QMessageBox, QToolButton, QSpinBox,
 )
+from PyQt6.QtNetwork import QNetworkCookie
 from PyQt6.QtWebEngineCore import (
     QWebEngineUrlRequestInterceptor, QWebEngineProfile, QWebEngineScript,
 )
@@ -69,6 +72,39 @@ def get_resource_path(filename: str) -> str:
 # Third-party binaries (ffmpeg.exe, ffprobe.exe, yt-dlp.exe) live here.
 # In dev this is <repo_root>/ffmpeg; when frozen it is <exe_dir>/ffmpeg.
 FFMPEG_DIR = os.path.join(BASE_DIR, "ffmpeg")
+
+
+# ---------------------------------------------------------------------------
+# Persistent app data (browser profile + exported cookies for yt-dlp)
+# ---------------------------------------------------------------------------
+
+def app_data_dir() -> str:
+    """Writable per-user app data folder, created on demand."""
+    base = QStandardPaths.writableLocation(
+        QStandardPaths.StandardLocation.AppDataLocation)
+    if not base:
+        base = os.path.join(os.path.expanduser("~"),
+                            ".universal_downloader_plus")
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def browser_data_dir() -> str:
+    """Chromium storage/cache root for the persistent QWebEngineProfile."""
+    path = os.path.join(app_data_dir(), "browser_data")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def cookie_file_path() -> str:
+    """Netscape cookie jar handed to yt-dlp via 'cookiefile'."""
+    return os.path.join(app_data_dir(), "yt_dlp_cookies.txt")
+
+
+def ydl_cookie_opts() -> dict:
+    """Common yt-dlp options that share the embedded browser's login state."""
+    path = cookie_file_path()
+    return {"cookiefile": path} if os.path.isfile(path) else {}
 
 AD_DOMAINS = (
     "doubleclick.net", "googlesyndication.com", "googleadservices.com",
@@ -238,6 +274,27 @@ QPushButton#navtab {
     font-weight: bold; border-radius: 0;
 }
 QPushButton#navtab:checked { border-bottom: 2px solid #2ea043; }
+QToolButton#mainnav {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 12px;
+    padding: 8px;
+    margin: 2px;
+}
+QToolButton#mainnav:hover {
+    background-color: rgba(160, 170, 185, 0.14);
+    border-color: rgba(160, 170, 185, 0.22);
+}
+QToolButton#mainnav:pressed {
+    background-color: rgba(160, 170, 185, 0.24);
+}
+QToolButton#mainnav:checked {
+    background-color: rgba(46, 160, 67, 0.16);
+    border-color: rgba(46, 160, 67, 0.45);
+}
+QToolButton#mainnav:checked:hover {
+    background-color: rgba(46, 160, 67, 0.24);
+}
 QToolButton#service {
     border-radius: 15px; font-size: 14px; font-weight: bold; padding: 12px;
     border: 1px solid rgba(128, 128, 128, 0.25);
@@ -430,6 +487,8 @@ class AnalyzeWorker(QThread):
             "socket_timeout": 10,        # give up if the network stalls 10s
             "retries": 3,                # no infinite retry loops
             "fragment_retries": 3,       #                       "
+            # Inherit the embedded browser's logged-in session.
+            **ydl_cookie_opts(),
         }
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -562,6 +621,8 @@ class DownloadWorker(QThread):
             pps.append({"key": "FFmpegMetadata", "add_metadata": True})
             opts["postprocessors"] = pps
             opts["progress_hooks"] = [self._hook]
+            # Inherit the embedded browser's logged-in session.
+            opts.update(ydl_cookie_opts())
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info_dict = ydl.extract_info(self.url, download=True)
 
@@ -1275,7 +1336,7 @@ class BrowserPage(QWidget):
         self.fwd_btn.clicked.connect(self.view.forward)
         self.reload_btn.clicked.connect(self.view.reload)
         self.home_btn.clicked.connect(
-            lambda: self.navigate("https://youtube.com"))
+            lambda: self.navigate("https://www.google.com"))
         self.addr.returnPressed.connect(self._addr_entered)
         self.view.urlChanged.connect(self._url_changed)
 
@@ -1378,23 +1439,250 @@ class DownloadsPage(QWidget):
 
 
 # ============================================================================
+# Persistent settings
+# ============================================================================
+
+SETTINGS_ORG = "Alok"
+SETTINGS_APP = "UniversalDownloaderPlus"
+
+FORMAT_CHOICES = ["Always Ask", "Best Video (MP4)", "Best Audio (MP3)"]
+THEME_CHOICES = ["Dark", "Light"]
+
+
+def default_download_dir() -> str:
+    """OS Downloads folder, falling back to ~/Downloads."""
+    path = QStandardPaths.writableLocation(
+        QStandardPaths.StandardLocation.DownloadLocation)
+    if not path:
+        path = os.path.join(os.path.expanduser("~"), "Downloads")
+    return os.path.normpath(path)
+
+
+def get_settings() -> QSettings:
+    return QSettings(SETTINGS_ORG, SETTINGS_APP)
+
+
+def load_settings() -> dict:
+    """Read persisted preferences, coercing types and applying defaults."""
+    s = get_settings()
+
+    download_dir = s.value("download_dir", "", type=str) or ""
+    if not download_dir or not os.path.isdir(download_dir):
+        download_dir = default_download_dir()
+
+    theme = s.value("theme", "dark", type=str)
+    if theme not in ("dark", "light"):
+        theme = "dark"
+
+    try:
+        max_concurrent = int(s.value("max_concurrent_downloads", 3))
+    except (TypeError, ValueError):
+        max_concurrent = 3
+    max_concurrent = max(1, min(10, max_concurrent))
+
+    preferred_format = s.value("preferred_format", FORMAT_CHOICES[0], type=str)
+    if preferred_format not in FORMAT_CHOICES:
+        preferred_format = FORMAT_CHOICES[0]
+
+    return {
+        "download_dir": download_dir,
+        "theme": theme,
+        "max_concurrent_downloads": max_concurrent,
+        "preferred_format": preferred_format,
+    }
+
+
+def save_settings(values: dict):
+    s = get_settings()
+    for key in ("download_dir", "theme", "max_concurrent_downloads",
+                "preferred_format"):
+        if key in values:
+            s.setValue(key, values[key])
+    s.sync()
+
+
+class SettingsModal(QDialog):
+    """Preferences dialog backed by QSettings."""
+
+    def __init__(self, parent, values: dict):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setModal(True)
+        self.setMinimumWidth(560)
+        self.values = dict(values)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 20, 22, 18)
+        root.setSpacing(16)
+
+        title = QLabel("Settings")
+        title.setStyleSheet("font-size: 18px; font-weight: bold;")
+        root.addWidget(title)
+
+        subtitle = QLabel("Preferences are saved and restored on next launch.")
+        subtitle.setStyleSheet("color: gray; font-size: 11px;")
+        root.addWidget(subtitle)
+
+        card = QFrame()
+        card.setObjectName("card")
+        form = QGridLayout(card)
+        form.setContentsMargins(16, 16, 16, 16)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(14)
+        form.setColumnStretch(1, 1)
+
+        # --- Download directory -----------------------------------------
+        form.addWidget(self._label("Download Directory"), 0, 0)
+        self.dir_edit = QLineEdit(self.values["download_dir"])
+        self.dir_edit.setMinimumHeight(34)
+        self.dir_edit.setPlaceholderText("Where finished files are saved")
+        form.addWidget(self.dir_edit, 0, 1)
+
+        self.browse_btn = QPushButton("  Browse")
+        self.browse_btn.setIcon(qta.icon("fa5s.folder-open", color="#e6edf3"))
+        self.browse_btn.setMinimumHeight(34)
+        self.browse_btn.setFixedWidth(110)
+        self.browse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.browse_btn.clicked.connect(self.browse_dir)
+        form.addWidget(self.browse_btn, 0, 2)
+
+        # --- Max concurrent downloads -------------------------------------
+        form.addWidget(self._label("Max Concurrent Downloads"), 1, 0)
+        self.concurrent_spin = QSpinBox()
+        self.concurrent_spin.setRange(1, 10)
+        self.concurrent_spin.setValue(self.values["max_concurrent_downloads"])
+        self.concurrent_spin.setMinimumHeight(34)
+        self.concurrent_spin.setToolTip(
+            "Extra downloads beyond this limit wait in the queue.")
+        form.addWidget(self.concurrent_spin, 1, 1, 1, 2)
+
+        # --- Default format -----------------------------------------------
+        form.addWidget(self._label("Default Format"), 2, 0)
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(FORMAT_CHOICES)
+        self.format_combo.setCurrentText(self.values["preferred_format"])
+        self.format_combo.setMinimumHeight(34)
+        self.format_combo.setToolTip(
+            "\"Always Ask\" opens the format dialog for every download.")
+        form.addWidget(self.format_combo, 2, 1, 1, 2)
+
+        # --- Theme -----------------------------------------------------------
+        form.addWidget(self._label("Theme"), 3, 0)
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(THEME_CHOICES)          # ["Dark", "Light"]
+        self.theme_combo.setCurrentText(
+            self.values["theme"].capitalize())
+        self.theme_combo.setMinimumHeight(34)
+        self.theme_combo.setToolTip("Applied immediately after saving.")
+        form.addWidget(self.theme_combo, 3, 1, 1, 2)
+
+        root.addWidget(card)
+
+        info = QLabel(f"ffmpeg: {FFMPEG_DIR}")
+        info.setStyleSheet("color: gray; font-size: 10px;")
+        info.setWordWrap(True)
+        root.addWidget(info)
+
+        # --- Buttons --------------------------------------------------------
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setMinimumSize(110, 38)
+        self.cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(self.cancel_btn)
+
+        self.save_btn = QPushButton("  Save")
+        self.save_btn.setObjectName("green")
+        self.save_btn.setIcon(qta.icon("fa5s.check", color="white"))
+        self.save_btn.setMinimumSize(120, 38)
+        self.save_btn.setDefault(True)
+        self.save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.save_btn.clicked.connect(self.on_save)
+        btn_row.addWidget(self.save_btn)
+
+        root.addLayout(btn_row)
+
+    @staticmethod
+    def _label(text: str) -> QLabel:
+        lab = QLabel(text)
+        lab.setStyleSheet("font-size: 12px;")
+        return lab
+
+    def browse_dir(self):
+        start = self.dir_edit.text().strip() or default_download_dir()
+        folder = QFileDialog.getExistingDirectory(
+            self, "Choose download folder", start)
+        if folder:
+            self.dir_edit.setText(os.path.normpath(folder))
+
+    def on_save(self):
+        folder = self.dir_edit.text().strip()
+        if not folder:
+            folder = default_download_dir()
+        folder = os.path.normpath(folder)
+        if not os.path.isdir(folder):
+            try:
+                os.makedirs(folder, exist_ok=True)
+            except OSError as e:
+                QMessageBox.warning(
+                    self, "Invalid folder",
+                    f"Could not use this download folder:\n{folder}\n\n{e}")
+                return
+
+        self.values.update({
+            "download_dir": folder,
+            "max_concurrent_downloads": self.concurrent_spin.value(),
+            "preferred_format": self.format_combo.currentText(),
+            "theme": self.theme_combo.currentText().lower(),
+        })
+        save_settings(self.values)
+        self.accept()
+
+
+# ============================================================================
 # Main window
 # ============================================================================
 
 class MainWindow(QMainWindow):
+    # (accessible name, qtawesome icon, tooltip) — rendered icon-only.
+    NAV_ITEMS = (
+        ("Home", "fa5s.home", "Home"),
+        ("Browser", "fa5s.compass", "Browser"),
+        ("Downloads", "fa5s.arrow-circle-down", "Downloads"),
+    )
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Universal Downloader+")
         self.resize(1180, 760)
 
-        self.save_dir = os.path.join(os.path.expanduser("~"), "Downloads")
-        self.workers = []           # keep refs so QThreads aren't GC'd
-        self.analyze_worker = None
-        self.dark = True
+        # --- Persisted preferences (loaded on startup) ---
+        self.settings = load_settings()
+        self.save_dir = self.settings["download_dir"]
+        self.max_concurrent = self.settings["max_concurrent_downloads"]
+        self.preferred_format = self.settings["preferred_format"]
 
-        # --- Web profile (standard defaults; ad-blocking disabled to keep
-        # compatibility with YouTube / yt-dlp) ---
+        self.workers = []           # keep refs so QThreads aren't GC'd
+        self.queue = []             # pending (args) beyond the concurrency cap
+        self.analyze_worker = None
+        self.dark = self.settings["theme"] == "dark"
+
+        # --- Persistent web profile: logins/cookies survive restarts and are
+        # mirrored to a Netscape jar so yt-dlp inherits the session. ---
+        self.cookie_path = cookie_file_path()
+        self._init_cookie_jar()
+
         self.profile = QWebEngineProfile("udl", self)
+        self.profile.setPersistentStoragePath(browser_data_dir())
+        self.profile.setCachePath(os.path.join(browser_data_dir(), "cache"))
+        self.profile.setPersistentCookiesPolicy(
+            QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
+        self.profile.setHttpCacheType(
+            QWebEngineProfile.HttpCacheType.DiskHttpCache)
+        self.profile.cookieStore().cookieAdded.connect(
+            self._export_cookie_to_netscape)
         # self.interceptor = AdBlockInterceptor()          # disabled
         # self.profile.setUrlRequestInterceptor(self.interceptor)
         # script = QWebEngineScript()                       # disabled
@@ -1406,6 +1694,59 @@ class MainWindow(QMainWindow):
         # self.profile.scripts().insert(script)
 
         self._build_ui()
+        self.apply_settings()
+
+    # ------------------------------------------------------------------
+    # Cookie export (QWebEngine -> Netscape jar for yt-dlp)
+    # ------------------------------------------------------------------
+    def _init_cookie_jar(self):
+        """Start a fresh jar each launch so stale/expired cookies don't pile up."""
+        self._seen_cookies = set()
+        try:
+            with open(self.cookie_path, "w", encoding="utf-8") as fh:
+                fh.write("# Netscape HTTP Cookie File\n")
+                fh.write("# Generated by Universal Downloader+ — do not edit.\n")
+        except OSError as e:
+            print(f"[Cookies] Could not create jar: {e}")
+
+    def _export_cookie_to_netscape(self, cookie: QNetworkCookie):
+        """Append one QNetworkCookie as a strict 7-column Netscape record.
+
+        Columns: domain, include_subdomains, path, secure, expiration,
+        name, value — tab separated.
+        """
+        try:
+            domain = bytes(cookie.domain()).decode() if isinstance(
+                cookie.domain(), (bytes, bytearray)) else cookie.domain()
+            domain = (domain or "").strip()
+            if not domain:
+                return
+
+            include_subdomains = "TRUE" if domain.startswith(".") else "FALSE"
+            path = cookie.path() or "/"
+            secure = "TRUE" if cookie.isSecure() else "FALSE"
+
+            expiry = cookie.expirationDate()
+            if cookie.isSessionCookie() or not expiry.isValid():
+                # Session cookies have no expiry; give yt-dlp a usable window.
+                expiration = int(time.time()) + 86400
+            else:
+                expiration = int(expiry.toSecsSinceEpoch())
+
+            name = bytes(cookie.name()).decode("utf-8", "replace")
+            value = bytes(cookie.value()).decode("utf-8", "replace")
+
+            key = (domain, path, name)
+            if key in self._seen_cookies:
+                return
+            self._seen_cookies.add(key)
+
+            line = "\t".join([domain, include_subdomains, path, secure,
+                              str(expiration), name, value])
+            with open(self.cookie_path, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except Exception as e:
+            print(f"[Cookies] Export failed: {e}")
 
     # ------------------------------------------------------------------
     def _build_ui(self):
@@ -1517,15 +1858,24 @@ class MainWindow(QMainWindow):
         header_col.addLayout(h)
         root.addWidget(header)
 
-        # ================= Nav tabs =================
+        # ================= Nav tabs (icon-only) =================
         tabs = QFrame()
         tl = QHBoxLayout(tabs)
-        tl.setContentsMargins(12, 0, 12, 0)
+        tl.setContentsMargins(12, 4, 12, 4)
+        tl.setSpacing(6)
         self.nav_btns = []
-        for i, name in enumerate(["Home", "Browser", "Downloads"]):
-            b = QPushButton(name)
-            b.setObjectName("navtab")
+        for i, (name, icon, tip) in enumerate(self.NAV_ITEMS):
+            b = QToolButton()
+            b.setObjectName("mainnav")
             b.setCheckable(True)
+            b.setAutoRaise(True)
+            b.setIcon(safe_icon(icon, "#c9d1d9"))
+            b.setIconSize(QSize(28, 28))
+            b.setFixedSize(50, 46)
+            b.setToolTip(tip)
+            b.setAccessibleName(name)
+            b.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.clicked.connect(lambda _, idx=i: self.switch_page(idx))
             tl.addWidget(b)
             self.nav_btns.append(b)
@@ -1556,6 +1906,15 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(idx)
         for i, b in enumerate(self.nav_btns):
             b.setChecked(i == idx)
+        self.refresh_nav_icons()
+
+    def refresh_nav_icons(self):
+        """Tint nav icons: accent green when active, muted otherwise."""
+        idle = "#c9d1d9" if self.dark else "#57606a"
+        active = "#3fb950"
+        for i, b in enumerate(self.nav_btns):
+            color = active if b.isChecked() else idle
+            b.setIcon(safe_icon(self.NAV_ITEMS[i][1], color))
 
     def open_in_browser(self, url: str):
         self.switch_page(1)
@@ -1577,12 +1936,19 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(
             self, "Choose download folder", self.save_dir)
         if folder:
-            self.save_dir = folder
-            self.dir_btn.setText("  " + (os.path.basename(folder) or folder))
-            self.dir_btn.setToolTip(folder)
+            self.set_save_dir(os.path.normpath(folder))
+            save_settings({"download_dir": self.save_dir})
+
+    def set_save_dir(self, folder: str):
+        self.save_dir = folder
+        self.settings["download_dir"] = folder
+        self.dir_btn.setText("  " + (os.path.basename(folder) or folder))
+        self.dir_btn.setToolTip(folder)
 
     def toggle_theme(self):
         self.dark = not self.dark
+        self.settings["theme"] = "dark" if self.dark else "light"
+        save_settings({"theme": self.settings["theme"]})
         self.apply_theme()
 
     def apply_theme(self):
@@ -1600,14 +1966,37 @@ class MainWindow(QMainWindow):
         self.settings_btn.setIcon(qta.icon("fa5s.cog", color=fg))
         self.paste_btn.setIcon(qta.icon("fa5s.clipboard", color=fg))
         self.dir_btn.setIcon(qta.icon("fa5s.folder-open", color=fg))
+        self.refresh_nav_icons()
 
     def open_settings(self):
-        QMessageBox.information(
-            self, "Settings",
-            f"Save directory: {self.save_dir}\n"
-            f"ffmpeg: {FFMPEG_DIR}\n"
-            f"Ad blocking: enabled\n"
-            f"Theme: {'Dark' if self.dark else 'Light'}")
+        dlg = SettingsModal(self, self.settings)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.settings.update(dlg.values)
+            self.apply_settings()
+            self.statusBar().showMessage("Settings saved.")
+
+    def apply_settings(self):
+        """Push the current settings dict into the live UI/runtime state."""
+        self.set_save_dir(self.settings["download_dir"])
+        self.max_concurrent = self.settings["max_concurrent_downloads"]
+        self.preferred_format = self.settings["preferred_format"]
+
+        # Default format preset mirrors the saved preference.
+        if self.preferred_format == "Best Audio (MP3)":
+            self.preset_format.setCurrentText("Audio")
+            self.preset_container.setCurrentText("Auto")
+            self.smart_toggle.setChecked(True)
+        elif self.preferred_format == "Best Video (MP4)":
+            self.preset_format.setCurrentText("Video")
+            self.preset_quality.setCurrentText("Best")
+            self.preset_container.setCurrentText("MP4")
+            self.smart_toggle.setChecked(True)
+        else:                                   # "Always Ask"
+            self.smart_toggle.setChecked(False)
+
+        self.dark = self.settings["theme"] == "dark"
+        self.apply_theme()
+        self.pump_queue()
 
     # ------------------------------------------------------------------
     # Analyze / paste flow
@@ -1804,13 +2193,11 @@ class MainWindow(QMainWindow):
         meta = "  ·  ".join(str(p) for p in meta_parts if p and p != "?")
 
         worker = DownloadWorker(
-            url, opts, thumb_url=entry.get("thumbnail") or "")
+            url, self.with_save_dir(opts),
+            thumb_url=entry.get("thumbnail") or "")
         item = DownloadItem(display_title, meta, b"", "playlist", worker)
         self.downloads_page.add_item(item)
-        self.workers.append(worker)
-        worker.done.connect(lambda *_: self.update_active_count())
-        worker.start()
-        self.update_active_count()
+        self.enqueue_worker(worker)
 
     PLAYLIST_STAGGER_MS = 350   # per-video start delay (rate-limit guard)
     PLAYLIST_MAX = 999
@@ -1913,24 +2300,78 @@ class MainWindow(QMainWindow):
         meta = "  ·  ".join(str(p) for p in meta_parts if p and p != "?")
 
         worker = DownloadWorker(
-            url, ydl_opts, thumb_url=display.get("thumbnail") or "")
+            url, self.with_save_dir(ydl_opts),
+            thumb_url=display.get("thumbnail") or "")
         item = DownloadItem(title, meta, thumb, kind, worker)
         self.downloads_page.add_item(item)
-        self.workers.append(worker)
-        worker.done.connect(lambda *_: self.update_active_count())
-        worker.start()
-        self.update_active_count()
+        self.enqueue_worker(worker)
 
         self.switch_page(2)
         self.statusBar().showMessage(f"Download started: {title}")
 
+    # ------------------------------------------------------------------
+    # Concurrency queue (honours settings["max_concurrent_downloads"])
+    # ------------------------------------------------------------------
+    def with_save_dir(self, opts: dict) -> dict:
+        """Force the output template to live under the saved download dir."""
+        opts = dict(opts)
+        tmpl = opts.get("outtmpl") or "%(title)s.%(ext)s"
+        if isinstance(tmpl, dict):
+            tmpl = tmpl.get("default") or "%(title)s.%(ext)s"
+
+        if os.path.isabs(tmpl):
+            rel = os.path.relpath(tmpl, self.save_dir)
+            if rel.startswith(".."):
+                # Built against a stale directory: keep the templated tail
+                # (e.g. "%(playlist_title)s/%(title)s.%(ext)s").
+                parts = []
+                head, tail = os.path.split(tmpl)
+                parts.append(tail)
+                while "%(" in os.path.basename(head):
+                    head, tail = os.path.split(head)
+                    parts.append(tail)
+                rel = os.path.join(*reversed(parts))
+            tmpl = rel
+
+        opts["outtmpl"] = os.path.join(self.save_dir, tmpl)
+        opts.setdefault("paths", {})["home"] = self.save_dir
+        return opts
+
+    def enqueue_worker(self, worker: DownloadWorker):
+        self.workers.append(worker)
+        worker.done.connect(lambda *_: self.on_worker_done())
+        self.queue.append(worker)
+        self.pump_queue()
+
+    def pump_queue(self):
+        """Start queued workers while under the concurrency limit."""
+        limit = max(1, int(getattr(self, "max_concurrent", 3)))
+        while self.queue and self.active_count() < limit:
+            worker = self.queue.pop(0)
+            if worker.is_cancelled:
+                continue
+            worker.start()
+        self.update_active_count()
+
+    def on_worker_done(self):
+        self.pump_queue()
+        self.update_active_count()
+
+    def active_count(self) -> int:
+        return sum(1 for w in self.workers if w.isRunning())
+
     def update_active_count(self):
-        active = sum(1 for w in self.workers if w.isRunning())
+        active = self.active_count()
+        queued = len(self.queue)
         color = "#3fb950" if active else "#6b7280"
-        self.status_dot.setText(f"● {active} active")
+        text = f"● {active} active"
+        if queued:
+            text += f"  ·  {queued} queued"
+        self.status_dot.setText(text)
         self.status_dot.setStyleSheet(f"color: {color};")
 
     def closeEvent(self, event):
+        self.queue.clear()
         for w in self.workers:
             w.is_cancelled = True
             w.is_paused = False
@@ -1954,6 +2395,8 @@ def main():
 
     qdarktheme.enable_hi_dpi()
     app = QApplication(sys.argv)
+    app.setOrganizationName(SETTINGS_ORG)
+    app.setApplicationName(SETTINGS_APP)
 
     # Application icon (taskbar / system tray). Use the .ico so Windows picks
     # the correct native resolution for the taskbar and title bar.
@@ -1961,9 +2404,10 @@ def main():
     if os.path.exists(app_icon_path):
         app.setWindowIcon(QIcon(app_icon_path))
 
-    qdarktheme.setup_theme("dark", additional_qss=CUSTOM_QSS)
+    # Honour the persisted theme before the first paint.
+    qdarktheme.setup_theme(load_settings()["theme"], additional_qss=CUSTOM_QSS)
     win = MainWindow()
-    win.apply_theme()  # sync icons/tooltips with the dark default
+    win.apply_theme()  # sync icons/tooltips with the saved theme
 
     # Window icon (top-left of the main window).
     if os.path.exists(app_icon_path):

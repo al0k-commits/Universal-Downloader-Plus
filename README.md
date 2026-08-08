@@ -227,8 +227,9 @@ mkdir -p dist/ffmpeg && cp ffmpeg/* dist/ffmpeg/
 On macOS/Linux swap the `--add-data` separator to `:`. macOS ignores `--onefile` for windowed apps and
 produces a `.app` bundle regardless — stage FFmpeg into `Contents/MacOS/ffmpeg`.
 
-> The tracked `app.spec` at the repo root is a **stale artifact** from an older CustomTkinter prototype
-> (it references a non-existent `app.py`). Don't build from it; use the commands above or let CI do it.
+There is no checked-in `.spec` file: builds are driven entirely by the CLI flags above, which is also
+exactly what [`release.yml`](.github/workflows/release.yml) runs. Any `*.spec` PyInstaller generates
+locally is git-ignored.
 
 </details>
 

@@ -12,6 +12,8 @@ import os
 import re
 import sys
 import time
+import json
+import uuid
 import ctypes
 import subprocess
 import threading
@@ -102,10 +104,165 @@ def cookie_file_path() -> str:
     return os.path.join(app_data_dir(), "yt_dlp_cookies.txt")
 
 
+def history_file_path() -> str:
+    """JSON file holding the persistent download history."""
+    return os.path.join(app_data_dir(), "downloads_history.json")
+
+
+def thumb_cache_dir() -> str:
+    """Local cache of download thumbnails referenced by the history file."""
+    path = os.path.join(app_data_dir(), "thumbnails")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def ydl_cookie_opts() -> dict:
-    """Common yt-dlp options that share the embedded browser's login state."""
-    path = cookie_file_path()
-    return {"cookiefile": path} if os.path.isfile(path) else {}
+    """Common yt-dlp options that share the embedded browser's login state.
+
+    Returns {} when the jar holds nothing but anonymous visitor tokens, which
+    would otherwise trigger HTTP 403 on the media fetch.
+    """
+    path = sanitized_cookie_file()
+    return {"cookiefile": path} if path and os.path.isfile(path) else {}
+
+
+# ---------------------------------------------------------------------------
+# Anti-bot / HTTP 403 mitigation
+# ---------------------------------------------------------------------------
+# YouTube rejects requests whose player client looks automated. Adding extra
+# InnerTube clients alongside the default gives yt-dlp fallbacks when one
+# client is throttled or 403s.
+#
+# NOTE: "default" MUST stay in the list. Pinning explicit clients such as
+# android/ios/tv or web+android strips every adaptive format and caps
+# downloads at 360p (measured 2026-08-08: 31 formats / 2160p with default,
+# 5 formats / 360p with ["web", "android"]).
+#
+# "-tv_simply" subtracts that one client from the default set. tv_simply
+# requires a GVS PO Token we cannot mint, so it emits
+#   "tv_simply client https formats require a GVS PO Token"
+# and contributes no usable formats. Removing it silences the warning while
+# keeping the full 2160p ladder.
+YOUTUBE_PLAYER_CLIENTS = ["default", "-tv_simply"]
+
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+              " (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+
+def _fragment_retry_sleep(n):
+    """Wait 2s between fragment retries (module-level so it stays picklable)."""
+    return 2
+
+
+def ydl_antibot_opts() -> dict:
+    """Options that keep YouTube from returning HTTP 403 Forbidden."""
+    return {
+        # Correct schema: {extractor: {arg_key: [values]}} — a bare
+        # ['client=...'] list is silently ignored by yt-dlp.
+        "extractor_args": {
+            "youtube": {"player_client": list(YOUTUBE_PLAYER_CLIENTS)},
+        },
+        "http_headers": {"User-Agent": USER_AGENT},
+        # 403s on media URLs are often transient; let yt-dlp re-resolve them.
+        "retries": 5,
+        "extractor_retries": 3,
+        # Survive single dropped packets mid-download instead of aborting.
+        "fragment_retries": 10,
+        "retry_sleep_functions": {"fragment": _fragment_retry_sleep},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cookie hygiene (the actual cause of mid-download 403s)
+# ---------------------------------------------------------------------------
+# Anonymous "visitor" cookies bind googlevideo stream URLs to a GVS PO Token
+# that we cannot mint. Metadata extraction still succeeds, so the failure only
+# surfaces mid-download as: "unable to download video data: HTTP Error 403".
+#
+# Measured 2026-08-08 on the same video and client set:
+#   no cookies                -> download OK
+#   full exported jar         -> HTTP 403
+#   jar minus these cookies   -> download OK
+#
+# Real login cookies (SID/SAPISID/__Secure-*PSID) are NOT in this list: those
+# authenticate the request and are exempt from the visitor-token binding.
+VISITOR_COOKIES = frozenset({
+    "VISITOR_INFO1_LIVE",
+    "VISITOR_PRIVACY_METADATA",
+    "YSC",
+    "GPS",
+    "__Secure-ROLLOUT_TOKEN",
+})
+
+# Presence of any of these means the user is genuinely signed in.
+LOGIN_COOKIES = frozenset({
+    "SID", "SSID", "HSID", "APISID", "SAPISID",
+    "__Secure-1PSID", "__Secure-3PSID", "LOGIN_INFO",
+})
+
+
+def _read_cookie_records(path: str) -> list:
+    """Return non-comment Netscape cookie lines from the jar."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return [l for l in fh
+                    if l.strip() and not l.startswith("#") and "\t" in l]
+    except OSError:
+        return []
+
+
+def sanitized_cookie_file() -> str:
+    """Path to a cookie jar safe to hand yt-dlp, or "" if none is usable.
+
+    When signed in, the jar is passed through untouched. When signed out, the
+    visitor cookies are stripped (they cause 403s and grant no access), and if
+    nothing meaningful remains we return "" so yt-dlp runs cookie-free.
+    """
+    src = cookie_file_path()
+    records = _read_cookie_records(src)
+    if not records:
+        return ""
+
+    names = {r.split("\t")[5] for r in records if len(r.split("\t")) > 5}
+    if names & LOGIN_COOKIES:
+        return src          # authenticated: keep everything
+
+    keep = [r for r in records
+            if r.split("\t")[5] not in VISITOR_COOKIES]
+    if not keep:
+        return ""           # nothing but visitor tokens — better to send none
+
+    clean = os.path.join(app_data_dir(), "yt_dlp_cookies_clean.txt")
+    try:
+        with open(clean, "w", encoding="utf-8") as fh:
+            fh.write("# Netscape HTTP Cookie File\n")
+            fh.write("# Auto-filtered by Universal Downloader+ "
+                     "(visitor tokens removed to avoid HTTP 403).\n")
+            fh.writelines(keep)
+        return clean
+    except OSError:
+        return ""
+
+
+def ydl_base_opts() -> dict:
+    """Cookies + anti-bot options shared by every yt-dlp invocation."""
+    opts = ydl_antibot_opts()
+    opts.update(ydl_cookie_opts())
+    return opts
+
+
+def flush_ydl_cache():
+    """Drop yt-dlp's cached YouTube ciphers (equivalent of --rm-cache-dir).
+
+    'rm_cachedir' is a CLI-only flag: passing it to YoutubeDL(...) is a silent
+    no-op. The programmatic equivalent is ydl.cache.remove().
+    """
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+            ydl.cache.remove()
+        print("[yt-dlp] Signature cache flushed.")
+    except Exception as e:
+        print(f"[yt-dlp] Cache flush failed: {e}")
 
 AD_DOMAINS = (
     "doubleclick.net", "googlesyndication.com", "googleadservices.com",
@@ -274,6 +431,9 @@ DANGER = "#ef4444"           # red-500
 DANGER_HOVER = "#f87171"
 INFO = "#60a5fa"             # blue-400
 
+NAV_IDLE_DARK = "#a1a1aa"    # zinc-400
+NAV_IDLE_LIGHT = "#52525b"   # zinc-600
+
 DARK_TOKENS = {
     "bg": "#18181b",          # zinc-900
     "surface": "#27272a",     # zinc-800
@@ -331,6 +491,10 @@ def rounded_thumbnail(data: bytes, w: int, h: int, radius: int = 8) -> QPixmap:
 def build_qss(dark: bool = True) -> str:
     """Compose the full application stylesheet for the given theme."""
     t = theme_tokens(dark)
+    nav_idle = NAV_IDLE_DARK if dark else NAV_IDLE_LIGHT
+    nav_hover_fg = "#ffffff" if dark else "#18181b"
+    nav_hover_bg = ("rgba(255, 255, 255, 0.06)" if dark
+                    else "rgba(24, 24, 27, 0.06)")
     return f"""
 /* ===================== Base typography & surfaces ===================== */
 * {{
@@ -401,11 +565,38 @@ QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled {{
     background-color: {t['surface_alt']};
 }}
 QLineEdit#urlbox {{ font-size: 14px; padding: 10px 16px; }}
+
+/* Compact Smart Mode preset row.
+   Qt adds padding+border on top of min/max-height, so the box values are
+   reduced by 10px to land on a 24-28px rendered control. */
+QComboBox#preset, QPushButton#preset {{
+    padding: 4px 10px;
+    font-size: 12px;
+    font-weight: 400;
+    border-radius: 6px;
+    min-height: 14px;
+    max-height: 18px;
+}}
+QComboBox#preset::drop-down {{ width: 18px; }}
+QPushButton#preset {{ text-align: left; }}
+QLabel#presetLabel {{
+    font-size: 10px;
+    font-weight: 500;
+    color: {NAV_IDLE_DARK if dark else NAV_IDLE_LIGHT};
+    letter-spacing: 0.3px;
+    padding-left: 2px;
+}}
 QLineEdit#addrbar {{
     font-size: 12px;
-    padding: 7px 14px;
-    border-radius: {RADIUS_PILL}px;
-    background-color: {t['surface_alt']};
+    border-radius: {RADIUS_CARD}px;
+    padding: 6px 12px;
+    background-color: {t['surface']};
+    border: 1px solid {t['border']};
+}}
+QLineEdit#addrbar:hover {{ background-color: {t['surface_alt']}; }}
+QLineEdit#addrbar:focus {{
+    border: 1px solid {ACCENT};
+    background-color: {t['surface']};
 }}
 QComboBox::drop-down {{ border: none; width: 22px; }}
 QComboBox::down-arrow {{ width: 0; height: 0; }}
@@ -488,37 +679,54 @@ QPushButton#navtab:checked {{
     font-weight: 600;
 }}
 
-/* Icon-only navigation + utility buttons */
-QToolButton#mainnav, QToolButton#utilnav, QToolButton#browsernav {{
+/* Main navigation: strictly icon-only, compact pill */
+QToolButton#mainnav {{
+    background: transparent;
+    border: none;
+    padding: 0;
+    border-radius: {RADIUS_INPUT}px;
+    color: {nav_idle};
+}}
+QToolButton#mainnav:hover {{
+    background: {nav_hover_bg};
+    color: {nav_hover_fg};
+}}
+QToolButton#mainnav:pressed {{ background: {t['pressed']}; }}
+QToolButton#mainnav:checked {{
+    background: rgba(34, 197, 94, 0.15);
+    color: {ACCENT};
+}}
+QToolButton#mainnav:checked:hover {{ background: rgba(34, 197, 94, 0.22); }}
+
+/* Icon-only utility + browser buttons */
+QToolButton#utilnav, QToolButton#browsernav {{
     background: transparent;
     border: 1px solid transparent;
     border-radius: {RADIUS_INPUT}px;
     padding: 8px;
     margin: 2px;
 }}
-QToolButton#mainnav {{ border-radius: {RADIUS_CARD}px; }}
-QToolButton#mainnav:hover, QToolButton#utilnav:hover, QToolButton#browsernav:hover {{
+QToolButton#utilnav:hover, QToolButton#browsernav:hover {{
     background-color: {t['hover']};
     border-color: {t['border']};
 }}
-QToolButton#mainnav:pressed, QToolButton#utilnav:pressed,
+QToolButton#utilnav:pressed,
 QToolButton#browsernav:pressed {{ background-color: {t['pressed']}; }}
-QToolButton#mainnav:checked {{
-    background-color: rgba(34, 197, 94, 0.16);
-    border-color: rgba(34, 197, 94, 0.45);
+QToolButton#browsernav {{ border-radius: 8px; }}
+QToolButton#browsernav:disabled {{
+    background: transparent;
+    border-color: transparent;
 }}
-QToolButton#mainnav:checked:hover {{ background-color: rgba(34, 197, 94, 0.24); }}
-QToolButton#browsernav:disabled {{ background: transparent; border-color: transparent; }}
 
 /* Floating action button inside the browser */
 QPushButton#fab {{
     background-color: {ACCENT};
     border: none;
-    color: #06240f;
+    color: #000000;
     font-size: 14px;
     font-weight: 600;
-    border-radius: 24px;
-    padding: 0 26px;
+    border-radius: 20px;
+    padding: 10px 20px;
 }}
 QPushButton#fab:hover {{ background-color: {ACCENT_HOVER}; }}
 QPushButton#fab:pressed {{ background-color: {ACCENT_PRESSED}; }}
@@ -559,6 +767,15 @@ QLabel#badgeError {{
     background-color: rgba(239, 68, 68, 0.14); color: {DANGER_HOVER};
     border: 1px solid rgba(239, 68, 68, 0.36);
 }}
+QLabel#badgeQuality {{
+    background-color: rgba(96, 165, 250, 0.14);
+    color: {INFO};
+    border: 1px solid rgba(96, 165, 250, 0.34);
+    border-radius: {RADIUS_PILL}px;
+    padding: 3px 10px;
+    font-size: 11px;
+    font-weight: 600;
+}}
 QLabel#badgeRecommended {{
     background-color: rgba(34, 197, 94, 0.18);
     color: {ACCENT_HOVER};
@@ -580,6 +797,19 @@ QProgressBar {{
     text-align: center;
 }}
 QProgressBar::chunk {{ background-color: {ACCENT}; border-radius: 4px; }}
+
+/* Hairline page-load indicator under the browser nav bar */
+QProgressBar#browserProgress {{
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    max-height: 3px;
+    min-height: 3px;
+}}
+QProgressBar#browserProgress::chunk {{
+    background-color: {ACCENT};
+    border-radius: 0;
+}}
 
 /* =========================== Checkboxes ============================== */
 QCheckBox {{ spacing: 10px; background: transparent; }}
@@ -811,10 +1041,10 @@ class AnalyzeWorker(QThread):
         opts = {
             "skip_download": True,
             "socket_timeout": 10,        # give up if the network stalls 10s
-            "retries": 3,                # no infinite retry loops
-            "fragment_retries": 3,       #                       "
-            # Inherit the embedded browser's logged-in session.
-            **ydl_cookie_opts(),
+            "ffmpeg_location": FFMPEG_DIR,
+            # Anti-403: PO-token-free player clients, desktop UA, bounded
+            # retries, plus the embedded browser's sanitized cookie jar.
+            **ydl_base_opts(),
         }
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -947,10 +1177,29 @@ class DownloadWorker(QThread):
             pps.append({"key": "FFmpegMetadata", "add_metadata": True})
             opts["postprocessors"] = pps
             opts["progress_hooks"] = [self._hook]
-            # Inherit the embedded browser's logged-in session.
-            opts.update(ydl_cookie_opts())
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info_dict = ydl.extract_info(self.url, download=True)
+
+            # Anti-403: extra player clients + desktop UA + retries, plus the
+            # embedded browser's cookies. Caller-supplied headers win.
+            base = ydl_base_opts()
+            headers = {**base.pop("http_headers", {}),
+                       **(opts.get("http_headers") or {})}
+            for key, value in base.items():
+                opts.setdefault(key, value)
+            opts["http_headers"] = headers
+
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info_dict = ydl.extract_info(self.url, download=True)
+            except yt_dlp.utils.DownloadError as e:
+                # A mid-download 403 usually means the cached YouTube cipher
+                # went stale. Flush it and retry once before giving up.
+                if "403" not in str(e) or self.is_cancelled:
+                    raise
+                print("[DownloadWorker] 403 received — flushing cipher cache "
+                      "and retrying once.")
+                flush_ydl_cache()
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info_dict = ydl.extract_info(self.url, download=True)
 
             final_path = None
             if "requested_downloads" in info_dict:
@@ -1007,6 +1256,29 @@ def _recommend_format(formats: list, is_audio: bool = False) -> dict | None:
     return best[-1] if best else None
 
 
+def format_quality_label(fmt: dict | None, is_audio: bool = False) -> str:
+    """Human label for the *selected* format: "1080p", "128kbps", "Audio".
+
+    Falls back to the container/format_id when a format dict lacks height, so
+    the UI never silently shows a stale resolution.
+    """
+    if is_audio:
+        abr = (fmt or {}).get("abr") or (fmt or {}).get("tbr")
+        return f"Audio · {abr:.0f}kbps" if abr else "Audio"
+    if not fmt:
+        return "Best"
+    height = fmt.get("height")
+    if height:
+        label = f"{height}p"
+        fps = fmt.get("fps") or 0
+        if fps >= 50:
+            label += f"{fps:.0f}"      # 1080p60
+        return label
+    return (fmt.get("format_note")
+            or (fmt.get("ext") or "").upper()
+            or str(fmt.get("format_id") or "Best"))
+
+
 def get_best_format(info, media_type: str = "video") -> dict | None:
     """Headless best-format recommendation (Smart Mode / external callers).
 
@@ -1039,7 +1311,8 @@ class DownloadModal(QDialog):
             if entries:
                 self.display = entries[0]
         self.save_dir = save_dir
-        self.selected_opts_list = []   # list of (opts_dict, kind_str)
+        # list of (opts_dict, kind_str, quality_str)
+        self.selected_opts_list = []
         self.fmt_checkboxes = []       # QCheckBox instances
 
         self.setWindowTitle("Download")
@@ -1367,7 +1640,10 @@ class DownloadModal(QDialog):
                     opts["postprocessors"] = [
                         {"key": "FFmpegEmbedSubtitle"}]
 
-            self.selected_opts_list.append((opts, kind))
+            # Carry the *chosen* format's quality to the UI row so it can't
+            # fall back to the info dict's default resolution.
+            quality_str = format_quality_label(fmt, is_audio)
+            self.selected_opts_list.append((opts, kind, quality_str))
         self.accept()
 
 
@@ -1379,12 +1655,22 @@ class DownloadItem(QFrame):
     THUMB_W, THUMB_H = 120, 68
 
     def __init__(self, title: str, meta: str, thumb: bytes, kind: str,
-                 worker: DownloadWorker):
+                 worker: DownloadWorker | None, quality_str: str = ""):
         super().__init__()
         self.setObjectName("downloadCard")
         self.kind = kind
         self.worker = worker
         self.file_path = ""
+        self.quality_str = quality_str or ""
+
+        # History wiring (set by MainWindow / restore_history).
+        self.history = None          # DownloadHistory instance
+        self.entry_id = ""           # id of this row's JSON record
+        self.source_url = ""
+        self.thumb_path = ""
+        self.title_text = title
+        self.meta_text = meta
+        self._thumb_bytes = thumb or b""
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(12, 12, 12, 12)
@@ -1409,6 +1695,13 @@ class DownloadItem(QFrame):
         self.title_label.setStyleSheet("font-size: 13px; font-weight: 600;")
         self.title_label.setWordWrap(True)
         title_row.addWidget(self.title_label, 1)
+
+        # Quality chip reflects the format the user actually picked.
+        self.quality_label = QLabel(self.quality_str)
+        self.quality_label.setObjectName("badgeQuality")
+        self.quality_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.quality_label.setVisible(bool(self.quality_str))
+        title_row.addWidget(self.quality_label, 0, Qt.AlignmentFlag.AlignTop)
 
         self.badge = QLabel("Queued")
         self.badge.setObjectName("badgeQueued")
@@ -1462,10 +1755,11 @@ class DownloadItem(QFrame):
         self.btns_layout.addWidget(self.cancel_btn)
         lay.addLayout(self.btns_layout)
 
-        worker.progress.connect(self.on_progress)
-        worker.progress_update.connect(self.on_progress_update)
-        worker.thumbnail_ready.connect(self.on_thumbnail_ready)
-        worker.done.connect(self.on_done)
+        if worker is not None:
+            worker.progress.connect(self.on_progress)
+            worker.progress_update.connect(self.on_progress_update)
+            worker.thumbnail_ready.connect(self.on_thumbnail_ready)
+            worker.done.connect(self.on_done)
 
         if thumb:
             self._set_cropped_thumbnail(thumb)
@@ -1487,6 +1781,7 @@ class DownloadItem(QFrame):
     # -- thumbnail (async bytes -> square, centered crop) ---------------
     def on_thumbnail_ready(self, data: bytes):
         if data:
+            self._thumb_bytes = data
             self._set_cropped_thumbnail(data)
 
     def _set_cropped_thumbnail(self, data: bytes):
@@ -1552,7 +1847,7 @@ class DownloadItem(QFrame):
             return
         self._remove_btn = self._row_action(
             "Remove", "fa5s.trash", "#a1a1aa", "actionClear",
-            self._remove_from_list, "Remove this row from the list")
+            self.clear_row, "Remove this row from the list and history")
         self.btns_layout.addWidget(self._remove_btn)
 
     def on_progress(self, d: dict):
@@ -1570,6 +1865,88 @@ class DownloadItem(QFrame):
             parts.append(f"ETA {eta}s")
         self.stat_label.setText("  ·  ".join(parts))
 
+    # -- history -----------------------------------------------------------
+    def bind_history(self, history, url: str, entry_id: str = ""):
+        """Attach this row to the JSON history log."""
+        self.history = history
+        self.source_url = url or ""
+        self.entry_id = entry_id or uuid.uuid4().hex
+
+    def _save_history(self, status: str, message: str):
+        """Persist this row's final state (completed / canceled / failed)."""
+        if self.history is None:
+            return
+        if not self.thumb_path and self._thumb_bytes:
+            self.thumb_path = self.history.cache_thumbnail(
+                self._thumb_bytes, self.entry_id)
+        self.history.add({
+            "id": self.entry_id,
+            "title": self.title_text,
+            "meta": self.meta_text,
+            "url": self.source_url,
+            "file_path": self.file_path,
+            "thumb_path": self.thumb_path,
+            "kind": self.kind,
+            "quality": self.quality_str,
+            "status": status,
+            "message": message,
+        })
+
+    # Legacy records (written before the quality chip existed) baked the info
+    # dict's default resolution into the meta string. Lift it out so old rows
+    # don't keep displaying a resolution the user never chose.
+    _LEGACY_RES_RE = re.compile(r"\s*·\s*\d{3,4}p(?:\d{2})?|\s*·\s*\d+fps")
+
+    @classmethod
+    def from_history(cls, entry: dict, history) -> "DownloadItem":
+        """Rebuild a finished row from a saved JSON record (no worker)."""
+        thumb = history.read_thumbnail(entry.get("thumb_path", ""))
+        meta = entry.get("meta") or ""
+        quality = entry.get("quality") or ""
+        if not quality:
+            # Recover the resolution from the old meta string, then strip it.
+            found = re.search(r"\b(\d{3,4}p(?:\d{2})?)\b", meta)
+            if found:
+                quality = found.group(1)
+            meta = cls._LEGACY_RES_RE.sub("", meta).strip(" ·")
+
+        item = cls(entry.get("title") or "Unknown",
+                   meta,
+                   thumb,
+                   entry.get("kind") or "video",
+                   None,
+                   quality)
+        item.history = history
+        item.entry_id = entry.get("id") or uuid.uuid4().hex
+        item.source_url = entry.get("url") or ""
+        item.thumb_path = entry.get("thumb_path") or ""
+        item.file_path = entry.get("file_path") or ""
+        item.restore_finished(entry.get("status") or "completed",
+                              entry.get("message") or "")
+        return item
+
+    def restore_finished(self, status: str, message: str):
+        """Paint a history row in its terminal state, no live controls."""
+        self.bar.hide()
+        self.speed_label.setText("")
+        self.pause_btn.hide()
+        self.cancel_btn.hide()
+
+        when = ""
+        if status == "completed":
+            self.set_badge("Completed", "done")
+            self.stat_label.setText(message or "Completed")
+            self.stat_label.setStyleSheet(
+                f"color: {ACCENT_HOVER}; font-size: 11px; font-weight: 500;")
+            self._swap_buttons_success()
+        else:
+            label = "Canceled" if status == "canceled" else "Failed"
+            self.set_badge(label, "error")
+            self.stat_label.setText(message or label)
+            self.stat_label.setStyleSheet(
+                f"color: {DANGER_HOVER}; font-size: 11px;")
+            self._inject_remove_button()
+
     def on_done(self, ok: bool, msg: str, file_path: str):
         self.file_path = file_path
 
@@ -1581,6 +1958,7 @@ class DownloadItem(QFrame):
             self.stat_label.setStyleSheet(
                 f"color: {ACCENT_HOVER}; font-size: 11px; font-weight: 500;")
             self._swap_buttons_success()
+            self._save_history("completed", msg)
         else:
             self.pause_btn.setEnabled(False)
             self.cancel_btn.setEnabled(False)
@@ -1591,6 +1969,7 @@ class DownloadItem(QFrame):
             self.stat_label.setText(msg)
             self.stat_label.setStyleSheet(
                 f"color: {DANGER_HOVER}; font-size: 11px;")
+            self._save_history("canceled" if cancelled else "failed", msg)
 
     def _swap_buttons_success(self):
         self.pause_btn.hide()
@@ -1608,8 +1987,26 @@ class DownloadItem(QFrame):
 
         self.clear_btn = self._row_action(
             "Clear", "fa5s.eraser", "#a1a1aa", "actionClear",
-            self.deleteLater, "Remove from the list (keeps the file on disk)")
+            self.clear_row,
+            "Remove from the list and history (keeps the file on disk)")
         self.btns_layout.addWidget(self.clear_btn)
+
+    def clear_row(self):
+        """Drop the row from the UI *and* from downloads_history.json."""
+        self._forget_history()
+        self._remove_from_list()
+
+    def _forget_history(self):
+        """Delete this row's JSON record and its cached thumbnail."""
+        if self.history is None or not self.entry_id:
+            return
+        self.history.remove(self.entry_id)
+        if self.thumb_path and os.path.isfile(self.thumb_path):
+            try:
+                os.remove(self.thumb_path)
+            except OSError:
+                pass
+        self.entry_id = ""
 
     def show_file(self):
         if not self.file_path or not os.path.isfile(self.file_path):
@@ -1641,16 +2038,22 @@ class DownloadItem(QFrame):
                 self.stat_label.setStyleSheet(
                     "color: #ff5555; font-size: 11px;")
                 return
+            self._forget_history()
             self._remove_from_list()
 
     def _remove_from_list(self):
-        parent = self.parent()
-        if parent:
-            lay = parent.layout()
-            if lay:
-                lay.removeWidget(self)
-        self.worker.is_cancelled = True
-        self.worker.is_paused = False
+        page = self.parent()
+        while page is not None and not isinstance(page, DownloadsPage):
+            page = page.parent()
+        if isinstance(page, DownloadsPage):
+            page.remove_item(self)
+        else:
+            parent = self.parent()
+            if parent and parent.layout():
+                parent.layout().removeWidget(self)
+        if self.worker is not None:
+            self.worker.is_cancelled = True
+            self.worker.is_paused = False
         self.deleteLater()
 
 
@@ -1817,8 +2220,12 @@ class BrowserPage(QWidget):
     def _update_nav_state(self):
         """Grey out Back/Forward when there is nowhere to go."""
         history = self.browser.history()
-        self.back_btn.setEnabled(history.canGoBack())
-        self.fwd_btn.setEnabled(history.canGoForward())
+        for btn, icon, enabled in (
+            (self.back_btn, "fa5s.arrow-left", history.canGoBack()),
+            (self.fwd_btn, "fa5s.arrow-right", history.canGoForward()),
+        ):
+            btn.setEnabled(enabled)
+            btn.setIcon(safe_icon(icon, "#a1a1aa" if enabled else "#52525b"))
 
     def on_download_clicked(self):
         """Read the live URL at click time, sanitise it, then analyse."""
@@ -1844,12 +2251,14 @@ class BrowserPage(QWidget):
             return text
 
         # A bare host needs a dot and no spaces to count as a domain.
-        host = text.split("/", 1)[0]
+        host = text.split("/", 1)[0].split("?", 1)[0]
+        tld = host.rsplit(".", 1)[-1] if "." in host else ""
         looks_like_domain = ("." in host
                              and " " not in text
                              and not host.endswith(".")
-                             and len(host.rsplit(".", 1)[-1]) >= 2)
-        if looks_like_domain or text.startswith("localhost"):
+                             and (tld.split(":")[0].isalpha() and len(tld) >= 2))
+        is_ip = re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}(:\d+)?", host) is not None
+        if looks_like_domain or is_ip or host.split(":")[0] == "localhost":
             return "https://" + text
         return ("https://www.google.com/search?q="
                 + requests.utils.quote(text))
@@ -1922,11 +2331,20 @@ class DownloadsPage(QWidget):
 
         self.current_filter = "All"
 
-    def add_item(self, item: DownloadItem):
+    def add_item(self, item: DownloadItem, at_end: bool = False):
         self.empty_label.hide()
         self.items.append(item)
-        self.list_lay.insertWidget(self.list_lay.count() - 1, item)
+        # Live downloads go on top; restored history appends below.
+        index = self.list_lay.count() - 1 if at_end else 0
+        self.list_lay.insertWidget(index, item)
         self.set_filter(self.current_filter)
+
+    def remove_item(self, item: DownloadItem):
+        if item in self.items:
+            self.items.remove(item)
+        self.list_lay.removeWidget(item)
+        if not self.items:
+            self.empty_label.show()
 
     def set_filter(self, name: str):
         self.current_filter = name
@@ -1938,6 +2356,103 @@ class DownloadsPage(QWidget):
         for item in self.items:
             visible = (name == "All") or (item.kind == kind_map.get(name))
             item.setVisible(visible)
+
+
+# ============================================================================
+# Download history (JSON)
+# ============================================================================
+
+class DownloadHistory:
+    """Append-only JSON log of finished/cancelled downloads.
+
+    Each record: {id, title, meta, url, file_path, thumb_path, kind,
+                  status, message, timestamp}
+    """
+
+    MAX_ENTRIES = 300
+
+    def __init__(self, path: str | None = None):
+        self.path = path or history_file_path()
+        self._lock = threading.Lock()
+        self.entries = self._read()
+
+    # -- disk I/O ---------------------------------------------------------
+    def _read(self) -> list:
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return [e for e in data if isinstance(e, dict)] \
+                if isinstance(data, list) else []
+        except (OSError, ValueError):
+            return []
+
+    def _write(self):
+        tmp = self.path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self.entries, fh, indent=2, ensure_ascii=False)
+            os.replace(tmp, self.path)
+        except OSError as e:
+            print(f"[History] Save failed: {e}")
+
+    # -- public API -------------------------------------------------------
+    def all(self) -> list:
+        """Newest first."""
+        return list(reversed(self.entries))
+
+    def add(self, record: dict) -> str:
+        """Insert (or replace by id) one record and flush to disk."""
+        with self._lock:
+            entry_id = record.get("id") or uuid.uuid4().hex
+            record = dict(record)
+            record["id"] = entry_id
+            record.setdefault("timestamp", time.time())
+            self.entries = [e for e in self.entries if e.get("id") != entry_id]
+            self.entries.append(record)
+            if len(self.entries) > self.MAX_ENTRIES:
+                self.entries = self.entries[-self.MAX_ENTRIES:]
+            self._write()
+        return entry_id
+
+    def remove(self, entry_id: str):
+        """Drop one record (used by the row's Clear/Remove buttons)."""
+        if not entry_id:
+            return
+        with self._lock:
+            before = len(self.entries)
+            self.entries = [e for e in self.entries
+                            if e.get("id") != entry_id]
+            if len(self.entries) != before:
+                self._write()
+
+    def clear(self):
+        with self._lock:
+            self.entries = []
+            self._write()
+
+    # -- thumbnail cache --------------------------------------------------
+    @staticmethod
+    def cache_thumbnail(data: bytes, entry_id: str) -> str:
+        """Persist thumbnail bytes so history rows keep their artwork."""
+        if not data:
+            return ""
+        path = os.path.join(thumb_cache_dir(), f"{entry_id}.jpg")
+        try:
+            with open(path, "wb") as fh:
+                fh.write(data)
+            return path
+        except OSError:
+            return ""
+
+    @staticmethod
+    def read_thumbnail(path: str) -> bytes:
+        if not path or not os.path.isfile(path):
+            return b""
+        try:
+            with open(path, "rb") as fh:
+                return fh.read()
+        except OSError:
+            return b""
 
 
 # ============================================================================
@@ -2197,18 +2712,30 @@ class MainWindow(QMainWindow):
         self.analyze_worker = None
         self.dark = self.settings["theme"] == "dark"
 
+        # Persistent download history (downloads_history.json).
+        self.history = DownloadHistory()
+
         # --- Persistent web profile: logins/cookies survive restarts and are
         # mirrored to a Netscape jar so yt-dlp inherits the session. ---
         self.cookie_path = cookie_file_path()
         self._init_cookie_jar()
 
+        storage = browser_data_dir()
+        cache = os.path.join(storage, "cache")
+        os.makedirs(cache, exist_ok=True)
+        if not os.access(storage, os.W_OK):
+            print(f"[Browser] WARNING: profile path not writable: {storage}")
+
+        # Named (non-OTR) profile: logins persist across restarts.
         self.profile = QWebEngineProfile("udl", self)
-        self.profile.setPersistentStoragePath(browser_data_dir())
-        self.profile.setCachePath(os.path.join(browser_data_dir(), "cache"))
+        self.profile.setPersistentStoragePath(storage)
+        self.profile.setCachePath(cache)
         self.profile.setPersistentCookiesPolicy(
             QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
         self.profile.setHttpCacheType(
             QWebEngineProfile.HttpCacheType.DiskHttpCache)
+        print(f"[Browser] Persistent profile at: {storage} "
+              f"(off-the-record={self.profile.isOffTheRecord()})")
         self.profile.cookieStore().cookieAdded.connect(
             self._export_cookie_to_netscape)
         # self.interceptor = AdBlockInterceptor()          # disabled
@@ -2223,6 +2750,28 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self.apply_settings()
+        self.restore_history()
+
+    # ------------------------------------------------------------------
+    # Download history
+    # ------------------------------------------------------------------
+    def restore_history(self):
+        """Rebuild saved download rows in the Downloads tab on startup."""
+        entries = self.history.all()          # newest first
+        if not entries:
+            return
+        restored = 0
+        for entry in entries:
+            try:
+                item = DownloadItem.from_history(entry, self.history)
+            except Exception as e:
+                print(f"[History] Skipped a bad record: {e}")
+                continue
+            self.downloads_page.add_item(item, at_end=True)
+            restored += 1
+        if restored:
+            self.statusBar().showMessage(
+                f"Restored {restored} download(s) from history.")
 
     # ------------------------------------------------------------------
     # Cookie export (QWebEngine -> Netscape jar for yt-dlp)
@@ -2324,7 +2873,7 @@ class MainWindow(QMainWindow):
 
         # --- Row 2: presets + toggles + status ---
         h = QHBoxLayout()
-        h.setSpacing(14)
+        h.setSpacing(8)
 
         self.smart_toggle = ToggleSwitch("Smart Mode")
         self.smart_toggle.setToolTip(
@@ -2340,29 +2889,24 @@ class MainWindow(QMainWindow):
             ["Best", "2160p", "1440p", "1080p", "720p", "480p"])
         self.preset_container = QComboBox()
         self.preset_container.addItems(["Auto", "MP4", "MKV"])
-        for lab, combo in [("Format", self.preset_format),
-                           ("Quality", self.preset_quality),
-                           ("Container", self.preset_container)]:
-            wrap = QVBoxLayout()
-            wrap.setSpacing(3)
-            lw = QLabel(lab)
-            lw.setStyleSheet("color: gray; font-size: 10px;")
-            wrap.addWidget(lw)
-            wrap.addWidget(combo)
-            h.addLayout(wrap)
+        for lab, combo, width in [("Format", self.preset_format, 90),
+                                  ("Quality", self.preset_quality, 92),
+                                  ("Container", self.preset_container, 90)]:
+            combo.setObjectName("preset")
+            combo.setFixedWidth(width)
+            combo.setCursor(Qt.CursorShape.PointingHandCursor)
+            h.addLayout(self._preset_column(lab, combo))
 
-        dir_wrap = QVBoxLayout()
-        dir_wrap.setSpacing(3)
-        dl = QLabel("Save to")
-        dl.setStyleSheet("color: gray; font-size: 10px;")
-        dir_wrap.addWidget(dl)
         self.dir_btn = QPushButton(
             "  " + (os.path.basename(self.save_dir) or self.save_dir))
-        self.dir_btn.setIcon(qta.icon("fa5s.folder-open", color="#e6edf3"))
+        self.dir_btn.setObjectName("preset")
+        self.dir_btn.setIcon(safe_icon("fa5s.folder-open", NAV_IDLE_DARK))
+        self.dir_btn.setIconSize(QSize(12, 12))
+        self.dir_btn.setMaximumWidth(170)
         self.dir_btn.setToolTip(self.save_dir)
+        self.dir_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.dir_btn.clicked.connect(self.pick_dir)
-        dir_wrap.addWidget(self.dir_btn)
-        h.addLayout(dir_wrap)
+        h.addLayout(self._preset_column("Save to", self.dir_btn))
 
         h.addStretch()
 
@@ -2384,20 +2928,20 @@ class MainWindow(QMainWindow):
         header_col.addLayout(h)
         root.addWidget(header)
 
-        # ================= Nav tabs (icon-only) =================
+        # ================= Nav tabs (strictly icon-only) =================
         tabs = QFrame()
         tl = QHBoxLayout(tabs)
         tl.setContentsMargins(12, 4, 12, 4)
-        tl.setSpacing(6)
+        tl.setSpacing(4)
         self.nav_btns = []
         for i, (name, icon, tip) in enumerate(self.NAV_ITEMS):
             b = QToolButton()
             b.setObjectName("mainnav")
             b.setCheckable(True)
             b.setAutoRaise(True)
-            b.setIcon(safe_icon(icon, "#c9d1d9"))
-            b.setIconSize(QSize(28, 28))
-            b.setFixedSize(50, 46)
+            b.setIcon(safe_icon(icon, NAV_IDLE_DARK))
+            b.setIconSize(QSize(22, 22))
+            b.setFixedSize(40, 40)          # compact; never stretches the row
             b.setToolTip(tip)
             b.setAccessibleName(name)
             b.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
@@ -2426,6 +2970,18 @@ class MainWindow(QMainWindow):
         self.switch_page(0)
 
     @staticmethod
+    def _preset_column(label: str, widget) -> QVBoxLayout:
+        """Muted micro-header stacked above a compact preset control."""
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        col.setContentsMargins(0, 0, 0, 0)
+        lw = QLabel(label)
+        lw.setObjectName("presetLabel")
+        col.addWidget(lw)
+        col.addWidget(widget)
+        return col
+
+    @staticmethod
     def _make_util_button(icon: str, tip: str, slot) -> QToolButton:
         """Icon-only top-bar utility button styled like the main nav."""
         b = QToolButton()
@@ -2450,11 +3006,10 @@ class MainWindow(QMainWindow):
         self.refresh_nav_icons()
 
     def refresh_nav_icons(self):
-        """Tint nav icons: accent green when active, muted otherwise."""
-        idle = "#c9d1d9" if self.dark else "#57606a"
-        active = "#3fb950"
+        """Tint nav icons to match the QSS text colour for each state."""
+        idle = NAV_IDLE_DARK if self.dark else NAV_IDLE_LIGHT
         for i, b in enumerate(self.nav_btns):
-            color = active if b.isChecked() else idle
+            color = ACCENT if b.isChecked() else idle
             b.setIcon(safe_icon(self.NAV_ITEMS[i][1], color))
 
     def open_in_browser(self, url: str):
@@ -2513,7 +3068,7 @@ class MainWindow(QMainWindow):
         self.settings_btn.setIcon(safe_icon("fa5s.sliders-h", util_fg))
 
         self.paste_btn.setIcon(qta.icon("fa5s.clipboard", color=fg))
-        self.dir_btn.setIcon(qta.icon("fa5s.folder-open", color=fg))
+        self.dir_btn.setIcon(safe_icon("fa5s.folder-open", util_fg))
         self.refresh_nav_icons()
 
     def open_settings(self):
@@ -2614,8 +3169,8 @@ class MainWindow(QMainWindow):
 
         modal = DownloadModal(self, info, thumb, self.save_dir)
         if modal.exec() == QDialog.DialogCode.Accepted and modal.selected_opts_list:
-            for opts, kind in modal.selected_opts_list:
-                self.start_download(url, opts, info, kind, thumb)
+            for opts, kind, quality in modal.selected_opts_list:
+                self.start_download(url, opts, info, kind, thumb, quality)
 
     # ------------------------------------------------------------------
     # Playlist handling
@@ -2691,8 +3246,9 @@ class MainWindow(QMainWindow):
                       or url)
         modal = DownloadModal(self, first, thumb, self.save_dir)
         if modal.exec() == QDialog.DialogCode.Accepted and modal.selected_opts_list:
-            for opts, kind in modal.selected_opts_list:
-                self.start_download(single_url, opts, first, kind, thumb)
+            for opts, kind, quality in modal.selected_opts_list:
+                self.start_download(single_url, opts, first, kind, thumb,
+                                    quality)
 
     def _download_playlist_all(self, url: str, info: dict, entries: list,
                                thumb: bytes):
@@ -2715,6 +3271,8 @@ class MainWindow(QMainWindow):
         opts["outtmpl"] = outtmpl
         opts["noplaylist"] = True
 
+        quality = self.smart_quality_label(best, media_type)
+
         for i, entry in enumerate(entries[: self.PLAYLIST_MAX]):
             entry_url = (entry.get("webpage_url")
                          or entry.get("url")
@@ -2722,17 +3280,19 @@ class MainWindow(QMainWindow):
             per_entry = dict(opts)
             QTimer.singleShot(  # stagger starts to dodge rate limiting
                 i * self.PLAYLIST_STAGGER_MS,
-                lambda u=entry_url, o=per_entry, e=entry: (
-                    self._start_playlist_entry(u, o, e, playlist_title, total)))
+                lambda u=entry_url, o=per_entry, e=entry, q=quality: (
+                    self._start_playlist_entry(u, o, e, playlist_title, total,
+                                               q)))
 
-    def _start_playlist_entry(self, url, opts, entry, playlist_title, total):
+    def _start_playlist_entry(self, url, opts, entry, playlist_title, total,
+                              quality_str: str = ""):
         """Spawn one DownloadWorker + UI row for a single playlist entry."""
         title = entry.get("title") or "Unknown"
         display_title = f"[{playlist_title} · {total}] {title}"
 
+        # No per-entry height here either: the chip shows the requested
+        # quality, which is uniform across the batch.
         meta_parts = [human_duration(entry.get("duration"))]
-        if entry.get("height"):
-            meta_parts.append(f"{entry['height']}p")
         if entry.get("ext"):
             meta_parts.append(entry["ext"].upper())
         uploader = entry.get("uploader") or entry.get("channel")
@@ -2743,7 +3303,9 @@ class MainWindow(QMainWindow):
         worker = DownloadWorker(
             url, self.with_save_dir(opts),
             thumb_url=entry.get("thumbnail") or "")
-        item = DownloadItem(display_title, meta, b"", "playlist", worker)
+        item = DownloadItem(display_title, meta, b"", "playlist", worker,
+                            quality_str)
+        item.bind_history(self.history, url)
         self.downloads_page.add_item(item)
         self.enqueue_worker(worker)
 
@@ -2763,12 +3325,26 @@ class MainWindow(QMainWindow):
                           else "video")
             best = get_best_format(info, media_type)
             opts, kind = self.build_smart_opts(info, best)
-            self.start_download(url, opts, info, kind, thumb)
+            self.start_download(url, opts, info, kind, thumb,
+                                self.smart_quality_label(best, media_type))
         except Exception as e:
             print(f"Smart Mode failed: {e}")
             QMessageBox.critical(
                 self, "Smart Mode",
                 f"Automatic download failed:\n{e}")
+
+    def smart_quality_label(self, best: dict | None, media_type: str) -> str:
+        """Quality chip for Smart Mode rows.
+
+        The preset dropdown is authoritative when it pins a resolution
+        (e.g. "720p"); otherwise fall back to whatever format was picked.
+        """
+        if media_type == "audio":
+            return format_quality_label(best, is_audio=True)
+        preset = self.preset_quality.currentText()
+        if preset != "Best":
+            return preset                      # user pinned 1080p/720p/...
+        return format_quality_label(best, is_audio=False)
 
     # ------------------------------------------------------------------
     # Smart mode opts from global presets
@@ -2823,7 +3399,8 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Download management
     # ------------------------------------------------------------------
-    def start_download(self, url, ydl_opts, info, kind, thumb):
+    def start_download(self, url, ydl_opts, info, kind, thumb,
+                       quality_str: str = ""):
         display = info
         if info.get("_type") == "playlist" and info.get("entries"):
             entries = [e for e in info["entries"] if e]
@@ -2835,11 +3412,13 @@ class MainWindow(QMainWindow):
             count = len([e for e in info.get("entries") or [] if e])
             title = f"[Playlist · {count}] {title}"
 
+        # Quality comes from the *selected* format. Never fall back to
+        # display["height"]: that is the info dict's default stream and was
+        # the source of every row reading "1080p".
+        if not quality_str:
+            quality_str = format_quality_label(None, kind == "audio")
+
         meta_parts = [human_duration(display.get("duration"))]
-        if display.get("height"):
-            meta_parts.append(f"{display['height']}p")
-        if display.get("fps"):
-            meta_parts.append(f"{display['fps']:.0f}fps")
         if display.get("ext"):
             meta_parts.append(display["ext"].upper())
         uploader = display.get("uploader") or display.get("channel")
@@ -2850,7 +3429,8 @@ class MainWindow(QMainWindow):
         worker = DownloadWorker(
             url, self.with_save_dir(ydl_opts),
             thumb_url=display.get("thumbnail") or "")
-        item = DownloadItem(title, meta, thumb, kind, worker)
+        item = DownloadItem(title, meta, thumb, kind, worker, quality_str)
+        item.bind_history(self.history, url)
         self.downloads_page.add_item(item)
         self.enqueue_worker(worker)
 

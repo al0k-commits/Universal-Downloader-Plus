@@ -274,18 +274,18 @@ QPushButton#navtab {
     font-weight: bold; border-radius: 0;
 }
 QPushButton#navtab:checked { border-bottom: 2px solid #2ea043; }
-QToolButton#mainnav {
+QToolButton#mainnav, QToolButton#utilnav {
     background: transparent;
     border: 1px solid transparent;
     border-radius: 12px;
     padding: 8px;
     margin: 2px;
 }
-QToolButton#mainnav:hover {
+QToolButton#mainnav:hover, QToolButton#utilnav:hover {
     background-color: rgba(160, 170, 185, 0.14);
     border-color: rgba(160, 170, 185, 0.22);
 }
-QToolButton#mainnav:pressed {
+QToolButton#mainnav:pressed, QToolButton#utilnav:pressed {
     background-color: rgba(160, 170, 185, 0.24);
 }
 QToolButton#mainnav:checked {
@@ -1841,18 +1841,15 @@ class MainWindow(QMainWindow):
         self.status_dot.setStyleSheet("color: gray;")
         h.addWidget(self.status_dot)
 
-        self.theme_btn = QPushButton()
-        self.theme_btn.setIcon(qta.icon("fa5s.sun", color="#e6edf3"))
-        self.theme_btn.setFixedSize(38, 38)
-        self.theme_btn.setToolTip("Toggle light/dark theme")
-        self.theme_btn.clicked.connect(self.toggle_theme)
+        # --- Utility controls (icon-only, matches the main nav bar) ---
+        h.addSpacing(4)
+
+        self.theme_btn = self._make_util_button(
+            "fa5s.moon", "Switch to Light Mode", self.toggle_theme)
         h.addWidget(self.theme_btn)
 
-        self.settings_btn = QPushButton()
-        self.settings_btn.setIcon(qta.icon("fa5s.cog", color="#e6edf3"))
-        self.settings_btn.setFixedSize(38, 38)
-        self.settings_btn.setToolTip("Settings")
-        self.settings_btn.clicked.connect(self.open_settings)
+        self.settings_btn = self._make_util_button(
+            "fa5s.sliders-h", "Settings", self.open_settings)
         h.addWidget(self.settings_btn)
 
         header_col.addLayout(h)
@@ -1898,6 +1895,21 @@ class MainWindow(QMainWindow):
         # ================= Status bar =================
         self.statusBar().showMessage("Ready.")
         self.switch_page(0)
+
+    @staticmethod
+    def _make_util_button(icon: str, tip: str, slot) -> QToolButton:
+        """Icon-only top-bar utility button styled like the main nav."""
+        b = QToolButton()
+        b.setObjectName("utilnav")
+        b.setAutoRaise(True)
+        b.setIcon(safe_icon(icon, "#c9d1d9"))
+        b.setIconSize(QSize(24, 24))
+        b.setFixedSize(44, 42)
+        b.setToolTip(tip)
+        b.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        b.clicked.connect(slot)
+        return b
 
     # ------------------------------------------------------------------
     # Navigation
@@ -1946,10 +1958,13 @@ class MainWindow(QMainWindow):
         self.dir_btn.setToolTip(folder)
 
     def toggle_theme(self):
+        """Flip dark/light, persist the choice, and refresh the sun/moon icon."""
         self.dark = not self.dark
         self.settings["theme"] = "dark" if self.dark else "light"
         save_settings({"theme": self.settings["theme"]})
         self.apply_theme()
+        self.statusBar().showMessage(
+            f"{'Dark' if self.dark else 'Light'} mode enabled.")
 
     def apply_theme(self):
         """Switch qdarktheme dynamically; keep custom layout/green QSS."""
@@ -1958,12 +1973,15 @@ class MainWindow(QMainWindow):
             additional_qss=CUSTOM_QSS,
         )
         fg = "#e6edf3" if self.dark else "#1f2328"
-        # Sun shown in dark mode (click for light), moon in light mode
+        util_fg = "#c9d1d9" if self.dark else "#57606a"
+
+        # Moon while in dark mode, sun while in light mode.
         self.theme_btn.setIcon(
-            qta.icon("fa5s.sun" if self.dark else "fa5s.moon", color=fg))
+            safe_icon("fa5s.moon" if self.dark else "fa5s.sun", util_fg))
         self.theme_btn.setToolTip(
-            "Switch to light theme" if self.dark else "Switch to dark theme")
-        self.settings_btn.setIcon(qta.icon("fa5s.cog", color=fg))
+            "Switch to Light Mode" if self.dark else "Switch to Dark Mode")
+        self.settings_btn.setIcon(safe_icon("fa5s.sliders-h", util_fg))
+
         self.paste_btn.setIcon(qta.icon("fa5s.clipboard", color=fg))
         self.dir_btn.setIcon(qta.icon("fa5s.folder-open", color=fg))
         self.refresh_nav_icons()

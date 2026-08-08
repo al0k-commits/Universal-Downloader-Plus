@@ -1740,13 +1740,26 @@ class BrowserPage(QWidget):
             nav.addWidget(btn)
         nav.addSpacing(6)
 
-        self.addr = QLineEdit()
-        self.addr.setObjectName("addrbar")
-        self.addr.setPlaceholderText("Search Google or enter a URL...")
-        self.addr.setClearButtonEnabled(True)
-        self.addr.setMinimumHeight(34)
-        nav.addWidget(self.addr, 1)
+        # --- Omnibox ---
+        self.urlbox = QLineEdit()
+        self.urlbox.setObjectName("addrbar")
+        self.urlbox.setPlaceholderText("Search Google or enter a URL...")
+        self.urlbox.setClearButtonEnabled(True)
+        self.urlbox.setMinimumHeight(34)
+        self.urlbox.setToolTip("Type a URL, or any text to search Google")
+        self.addr = self.urlbox            # backwards-compatible alias
+        nav.addWidget(self.urlbox, 1)
         lay.addWidget(navbar)
+
+        # --- Page load progress (hairline under the nav bar) ---
+        self.browser_progress = QProgressBar()
+        self.browser_progress.setObjectName("browserProgress")
+        self.browser_progress.setRange(0, 100)
+        self.browser_progress.setValue(0)
+        self.browser_progress.setTextVisible(False)
+        self.browser_progress.setFixedHeight(3)
+        self.browser_progress.hide()
+        lay.addWidget(self.browser_progress)
 
         self.view = QWebEngineView(profile, self)
         self.browser = self.view
@@ -1755,29 +1768,57 @@ class BrowserPage(QWidget):
         # --- Floating action button (FAB) ---
         self.dl_btn = QPushButton("  Download", self)
         self.dl_btn.setObjectName("fab")
-        self.dl_btn.setIcon(safe_icon("fa5s.arrow-circle-down", "#06240f"))
-        self.dl_btn.setIconSize(QSize(20, 20))
-        self.dl_btn.setFixedSize(188, 48)
+        self.dl_btn.setIcon(safe_icon("fa5s.arrow-circle-down", "#000000"))
+        self.dl_btn.setIconSize(QSize(18, 18))
+        self.dl_btn.setFixedSize(176, 44)
         self.dl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.dl_btn.setToolTip("Download the media on this page")
         shadow = QGraphicsDropShadowEffect(self.dl_btn)
-        shadow.setBlurRadius(28)
-        shadow.setOffset(0, 6)
-        shadow.setColor(QColor(0, 0, 0, 170))
+        shadow.setBlurRadius(26)
+        shadow.setOffset(0, 5)
+        shadow.setColor(QColor(0, 0, 0, 165))
         self.dl_btn.setGraphicsEffect(shadow)
         self.dl_btn.hide()
         self.dl_btn.clicked.connect(self.on_download_clicked)
 
-        # Wiring
+        # --- Wiring ---
         self.back_btn.clicked.connect(self.view.back)
         self.fwd_btn.clicked.connect(self.view.forward)
         self.reload_btn.clicked.connect(self.view.reload)
         self.home_btn.clicked.connect(
             lambda: self.navigate("https://www.google.com"))
-        self.addr.returnPressed.connect(self._addr_entered)
+        self.urlbox.returnPressed.connect(self._addr_entered)
         self.view.urlChanged.connect(self._url_changed)
 
+        # Loading progress
+        self.view.loadStarted.connect(self._on_load_started)
+        self.view.loadProgress.connect(self.browser_progress.setValue)
+        self.view.loadFinished.connect(self._on_load_finished)
+
+        self.back_btn.setEnabled(False)
+        self.fwd_btn.setEnabled(False)
+
         self.navigate("https://www.youtube.com")
+
+    # -- load progress / history state -------------------------------------
+    def _on_load_started(self):
+        self.browser_progress.setValue(0)
+        self.browser_progress.show()
+        self.reload_btn.setIcon(safe_icon("fa5s.times", "#a1a1aa"))
+        self.reload_btn.setToolTip("Stop loading")
+
+    def _on_load_finished(self, ok: bool):
+        self.browser_progress.hide()
+        self.browser_progress.setValue(0)
+        self.reload_btn.setIcon(safe_icon("fa5s.redo", "#a1a1aa"))
+        self.reload_btn.setToolTip("Refresh")
+        self._update_nav_state()
+
+    def _update_nav_state(self):
+        """Grey out Back/Forward when there is nowhere to go."""
+        history = self.browser.history()
+        self.back_btn.setEnabled(history.canGoBack())
+        self.fwd_btn.setEnabled(history.canGoForward())
 
     def on_download_clicked(self):
         """Read the live URL at click time, sanitise it, then analyse."""
@@ -1792,21 +1833,40 @@ class BrowserPage(QWidget):
         print(f"[Browser Download] Triggering analysis for: {sanitized_url}")
         self.request_download.emit(sanitized_url)
 
+    # -- omnibox -----------------------------------------------------------
+    @staticmethod
+    def resolve_omnibox_input(text: str) -> str:
+        """URL or Google search? Return the address to load."""
+        text = (text or "").strip()
+        if not text:
+            return ""
+        if text.startswith(("http://", "https://", "file://", "about:")):
+            return text
+
+        # A bare host needs a dot and no spaces to count as a domain.
+        host = text.split("/", 1)[0]
+        looks_like_domain = ("." in host
+                             and " " not in text
+                             and not host.endswith(".")
+                             and len(host.rsplit(".", 1)[-1]) >= 2)
+        if looks_like_domain or text.startswith("localhost"):
+            return "https://" + text
+        return ("https://www.google.com/search?q="
+                + requests.utils.quote(text))
+
     def navigate(self, url: str):
-        if not url.startswith(("http://", "https://")):
-            if "." in url and " " not in url:
-                url = "https://" + url
-            else:
-                url = ("https://www.youtube.com/results?search_query="
-                       + requests.utils.quote(url))
-        self.view.setUrl(QUrl(url))
+        target = self.resolve_omnibox_input(url)
+        if target:
+            self.view.setUrl(QUrl(target))
 
     def _addr_entered(self):
-        self.navigate(self.addr.text().strip())
+        self.navigate(self.urlbox.text().strip())
 
     def _url_changed(self, qurl: QUrl):
         url = qurl.toString()
-        self.addr.setText(url)
+        self.urlbox.setText(url)
+        self.urlbox.setCursorPosition(0)
+        self._update_nav_state()
         if VIDEO_URL_RE.search(url):
             self.dl_btn.show()
             self.dl_btn.raise_()
@@ -1815,8 +1875,13 @@ class BrowserPage(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.dl_btn.move((self.width() - self.dl_btn.width()) // 2,
-                         self.height() - self.dl_btn.height() - 28)
+        self._place_fab()
+
+    def _place_fab(self):
+        """Pin the FAB to the bottom-right corner of the page area."""
+        margin = 24
+        self.dl_btn.move(self.width() - self.dl_btn.width() - margin,
+                         self.height() - self.dl_btn.height() - margin)
 
 
 class DownloadsPage(QWidget):

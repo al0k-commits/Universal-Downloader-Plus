@@ -15,6 +15,8 @@ import time
 import ctypes
 import subprocess
 import threading
+from urllib.parse import (urlparse, urlunparse, parse_qs, parse_qsl,
+                          urlencode)
 
 import requests
 import yt_dlp
@@ -74,9 +76,18 @@ AD_DOMAINS = (
     "googletagservices.com", "ads.youtube.com", "adnxs.com", "taboola.com",
     "outbrain.com", "scorecardresearch.com", "moatads.com", "adsafeprotected.com",
     "amazon-adsystem.com", "criteo.com", "pubmatic.com", "rubiconproject.com",
+    "adsystem.com",       # generic AdSystem network
+    "googlesyndication.org",
 )
 
-AD_PATH_MARKERS = ("/pagead", "/ptracking", "/ad_break", "/api/stats/ads")
+AD_PATH_MARKERS = (
+    "/pagead", "/pagead/", "/pagead2", "/pagead2/",
+    "/ptracking", "/ad_break", "/api/stats/ads", "/yt/ads",
+    "/get_midroll_info", "/youtubei/v1/player/ads",
+    "/companion=1", "/gfpcs", "/ad_data",
+)
+
+AD_HOST_MARKERS = ("adsystem", "ads.", "adserver", "adsense", "adservice")
 
 PLATFORMS = [
     ("YouTube", "https://www.youtube.com", "#FF0000", "fa5b.youtube"),
@@ -111,6 +122,66 @@ VIDEO_URL_RE = re.compile(
     r"|dailymotion\.com/video)",
     re.IGNORECASE,
 )
+
+# Query params that carry no media identity (tracking, timestamps, referrers).
+TRACKING_PARAMS = {
+    "si", "pp", "t", "start_radio", "feature", "ab_channel", "app",
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "gclid", "fbclid", "spm_id_from", "vd_source", "rco", "themeRefresh",
+}
+# Params that actually identify what to download.
+MEDIA_PARAMS = ("v", "list", "index", "video_id", "story_fbid", "id")
+
+
+def clean_media_url(url: str) -> str:
+    """Normalise a browser URL into a downloadable media URL.
+
+    Returns an empty string when the URL is not a concrete video/playlist
+    page (home pages, search results, about:blank, feeds, ...).
+    """
+    url = (url or "").strip()
+    if not url or url.lower().startswith(("about:", "chrome:", "data:",
+                                          "view-source:")):
+        return ""
+    if not url.startswith(("http://", "https://")):
+        if "." not in url or " " in url:
+            return ""
+        url = "https://" + url
+
+    parsed = urlparse(url)
+    host = parsed.netloc.lower().split(":")[0]
+    host = host[4:] if host.startswith("www.") else host
+    path = parsed.path or "/"
+
+    # --- YouTube family -------------------------------------------------
+    if host in ("youtube.com", "m.youtube.com", "music.youtube.com",
+                "youtube-nocookie.com"):
+        m = re.match(r"^/(?:shorts|live|embed|v)/([A-Za-z0-9_-]{6,})", path)
+        if m:
+            return f"https://www.youtube.com/watch?v={m.group(1)}"
+        params = parse_qs(parsed.query, keep_blank_values=False)
+        if path == "/watch" and params.get("v"):
+            vid = params["v"][0]
+            plist = (params.get("list") or [""])[0]
+            clean = f"https://www.youtube.com/watch?v={vid}"
+            if plist and not plist.startswith("RD"):
+                clean += f"&list={plist}"
+            return clean
+        if path == "/playlist" and params.get("list"):
+            return f"https://www.youtube.com/playlist?list={params['list'][0]}"
+        # Home page, /results, /feed/*, channel pages: nothing to download.
+        return ""
+
+    if host == "youtu.be":
+        vid = path.strip("/").split("/")[0]
+        return f"https://www.youtube.com/watch?v={vid}" if vid else ""
+
+    # --- Everything else: keep only meaningful query params --------------
+    if not VIDEO_URL_RE.search(url):
+        return ""
+    kept = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=False)
+            if k in MEDIA_PARAMS or k not in TRACKING_PARAMS]
+    return urlunparse(parsed._replace(query=urlencode(kept), fragment=""))
 
 AD_SKIP_JS = r"""
 (function() {
@@ -318,19 +389,23 @@ class DownloadCancelled(Exception):
 
 
 # ============================================================================
-# Ad blocker
+# Ad blocker (DISABLED - blocks yt-dlp API requests, causing YouTube to hang
+# on "Analyzing..."). Kept as a reference; re-enable with care.
 # ============================================================================
-
-class AdBlockInterceptor(QWebEngineUrlRequestInterceptor):
-    def interceptRequest(self, info):
-        url = info.requestUrl()
-        host = url.host().lower()
-        path = url.path().lower()
-        if any(host == d or host.endswith("." + d) for d in AD_DOMAINS):
-            info.block(True)
-            return
-        if any(m in path for m in AD_PATH_MARKERS):
-            info.block(True)
+#
+# class AdBlockInterceptor(QWebEngineUrlRequestInterceptor):
+#     def interceptRequest(self, info):
+#         url = info.requestUrl()
+#         host = url.host().lower()
+#         path = url.path().lower()
+#         if any(host == d or host.endswith("." + d) for d in AD_DOMAINS):
+#             info.block(True)
+#             return
+#         if any(m in host for m in AD_HOST_MARKERS):
+#             info.block(True)
+#             return
+#         if any(m in path for m in AD_PATH_MARKERS):
+#             info.block(True)
 
 
 # ============================================================================
@@ -348,8 +423,15 @@ class AnalyzeWorker(QThread):
         self.url = url
 
     def run(self):
+        # NOTE: no 'quiet'/'no_warnings' — we WANT yt-dlp's exact stderr in the
+        # terminal to diagnose network/retry hangs. Options below cap the hang.
+        opts = {
+            "skip_download": True,
+            "socket_timeout": 10,        # give up if the network stalls 10s
+            "retries": 3,                # no infinite retry loops
+            "fragment_retries": 3,       #                       "
+        }
         try:
-            opts = {"skip_download": True, "quiet": True, "no_warnings": True}
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(self.url, download=False)
 
@@ -379,9 +461,13 @@ class AnalyzeWorker(QThread):
             else:
                 self.result.emit(info, thumb)
         except yt_dlp.utils.DownloadError as e:
-            self.error.emit(str(e).replace("ERROR:", "").strip())
+            msg = str(e).replace("ERROR:", "").strip()
+            print(f"[AnalyzeWorker] DownloadError: {msg}")
+            self.error.emit(msg)
         except Exception as e:
-            self.error.emit(str(e))
+            msg = str(e)
+            print(f"[AnalyzeWorker] Unexpected error: {msg}")
+            self.error.emit(msg)
 
 
 class DownloadWorker(QThread):
@@ -1145,13 +1231,28 @@ class BrowserPage(QWidget):
         # Nav bar
         nav = QHBoxLayout()
         nav.setContentsMargins(8, 8, 8, 8)
-        self.back_btn = QPushButton("◀")
-        self.fwd_btn = QPushButton("▶")
-        self.reload_btn = QPushButton("↻")
-        self.home_btn = QPushButton("⌂")
-        for b in (self.back_btn, self.fwd_btn, self.reload_btn, self.home_btn):
-            b.setFixedSize(34, 30)
-            nav.addWidget(b)
+        nav.setSpacing(6)
+        self.back_btn = QToolButton()
+        self.fwd_btn = QToolButton()
+        self.reload_btn = QToolButton()
+        self.home_btn = QToolButton()
+        nav_buttons = (
+            (self.back_btn, "fa5s.arrow-left", "Back"),
+            (self.fwd_btn, "fa5s.arrow-right", "Forward"),
+            (self.reload_btn, "fa5s.redo", "Reload"),
+            (self.home_btn, "fa5s.home", "Home"),
+        )
+        for btn, icon, tip in nav_buttons:
+            btn.setIcon(safe_icon(icon, "#c9d1d9"))
+            btn.setIconSize(QSize(14, 14))
+            btn.setToolTip(tip)
+            btn.setFixedSize(32, 30)
+            btn.setStyleSheet(
+                "background: transparent; border: none; border-radius: 6px;"
+                " color: #c9d1d9;")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            nav.addWidget(btn)
+        nav.addSpacing(4)
 
         self.addr = QLineEdit()
         self.addr.setPlaceholderText("Enter URL or search...")
@@ -1159,6 +1260,7 @@ class BrowserPage(QWidget):
         lay.addLayout(nav)
 
         self.view = QWebEngineView(profile, self)
+        self.browser = self.view
         lay.addWidget(self.view, 1)
 
         # Floating download button
@@ -1166,19 +1268,31 @@ class BrowserPage(QWidget):
         self.dl_btn.setObjectName("green")
         self.dl_btn.setFixedSize(180, 44)
         self.dl_btn.hide()
-        self.dl_btn.clicked.connect(
-            lambda: self.request_download.emit(self.view.url().toString()))
+        self.dl_btn.clicked.connect(self.on_download_clicked)
 
         # Wiring
         self.back_btn.clicked.connect(self.view.back)
         self.fwd_btn.clicked.connect(self.view.forward)
         self.reload_btn.clicked.connect(self.view.reload)
         self.home_btn.clicked.connect(
-            lambda: self.navigate("https://www.youtube.com"))
+            lambda: self.navigate("https://youtube.com"))
         self.addr.returnPressed.connect(self._addr_entered)
         self.view.urlChanged.connect(self._url_changed)
 
         self.navigate("https://www.youtube.com")
+
+    def on_download_clicked(self):
+        """Read the live URL at click time, sanitise it, then analyse."""
+        current_url = self.browser.url().toString().strip()
+        sanitized_url = clean_media_url(current_url)
+        if not sanitized_url:
+            QMessageBox.information(
+                self, "Select a Video",
+                "Please open a specific video or playlist page first "
+                "before clicking Download.")
+            return
+        print(f"[Browser Download] Triggering analysis for: {sanitized_url}")
+        self.request_download.emit(sanitized_url)
 
     def navigate(self, url: str):
         if not url.startswith(("http://", "https://")):
@@ -1278,17 +1392,18 @@ class MainWindow(QMainWindow):
         self.analyze_worker = None
         self.dark = True
 
-        # --- Web profile with ad blocking + ad-skip JS ---
-        self.interceptor = AdBlockInterceptor()
+        # --- Web profile (standard defaults; ad-blocking disabled to keep
+        # compatibility with YouTube / yt-dlp) ---
         self.profile = QWebEngineProfile("udl", self)
-        self.profile.setUrlRequestInterceptor(self.interceptor)
-        script = QWebEngineScript()
-        script.setName("adskip")
-        script.setSourceCode(AD_SKIP_JS)
-        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentReady)
-        script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
-        script.setRunsOnSubFrames(True)
-        self.profile.scripts().insert(script)
+        # self.interceptor = AdBlockInterceptor()          # disabled
+        # self.profile.setUrlRequestInterceptor(self.interceptor)
+        # script = QWebEngineScript()                       # disabled
+        # script.setName("adskip")
+        # script.setSourceCode(AD_SKIP_JS)
+        # script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentReady)
+        # script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        # script.setRunsOnSubFrames(True)
+        # self.profile.scripts().insert(script)
 
         self._build_ui()
 
@@ -1428,7 +1543,7 @@ class MainWindow(QMainWindow):
         root.addWidget(self.stack, 1)
 
         self.home_page.open_url.connect(self.open_in_browser)
-        self.browser_page.request_download.connect(self.analyze_url)
+        self.browser_page.request_download.connect(self.on_browser_download)
 
         # ================= Status bar =================
         self.statusBar().showMessage("Ready.")
@@ -1445,6 +1560,18 @@ class MainWindow(QMainWindow):
     def open_in_browser(self, url: str):
         self.switch_page(1)
         self.browser_page.navigate(url)
+
+    def on_browser_download(self, url: str):
+        """Feed a URL coming from the embedded browser into the main pipeline."""
+        sanitized_url = clean_media_url(url)
+        if not sanitized_url:
+            QMessageBox.information(
+                self, "Select a Video",
+                "Please open a specific video or playlist page first "
+                "before clicking Download.")
+            return
+        self.url_edit.setText(sanitized_url)
+        self.analyze_url(sanitized_url)
 
     def pick_dir(self):
         folder = QFileDialog.getExistingDirectory(
@@ -1517,6 +1644,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Analyzing: {url}")
         self.paste_btn.setEnabled(False)
         self.go_btn.setEnabled(False)
+        self.go_btn.setText("  Analyzing...")
         self.analyze_worker = AnalyzeWorker(url)
         self.analyze_worker.result.connect(
             lambda info, thumb, u=url: self.on_analyzed(u, info, thumb))
@@ -1528,11 +1656,19 @@ class MainWindow(QMainWindow):
     def on_analyze_error(self, msg: str):
         self.paste_btn.setEnabled(True)
         self.go_btn.setEnabled(True)
-        self.statusBar().showMessage(f"Analyze failed: {msg}")
+        self.statusBar().showMessage("Ready.")
+        self.go_btn.setText("  Download")
+        QMessageBox.warning(
+            self, "Unsupported link",
+            "Could not find a supported video on this page.\n"
+            "Please try another link.",
+            QMessageBox.StandardButton.Ok,
+            QMessageBox.StandardButton.Ok)
 
     def on_analyzed(self, url: str, info: dict, thumb: bytes):
         self.paste_btn.setEnabled(True)
         self.go_btn.setEnabled(True)
+        self.go_btn.setText("  Download")
         self.statusBar().showMessage("Ready.")
 
         if self.smart_toggle.isChecked():
@@ -1550,6 +1686,7 @@ class MainWindow(QMainWindow):
     def on_playlist_found(self, url: str, info: dict, thumb: bytes):
         self.paste_btn.setEnabled(True)
         self.go_btn.setEnabled(True)
+        self.go_btn.setText("  Download")
         self.statusBar().showMessage("Ready.")
 
         if self.smart_toggle.isChecked():

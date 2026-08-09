@@ -17,7 +17,11 @@ concurrency:
 env:
   APP_NAME: UniversalDownloaderPlus
   PRODUCT_NAME: "Universal Downloader+"
+  DEB_PACKAGE: universal-downloader-plus
+  MAINTAINER: "Alok <al0k-commits@users.noreply.github.com>"
   WIX3_URL: https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip
+  # Official "latest stable 6.x" redirect published by jrsoftware.
+  INNO_URL: https://jrsoftware.org/download.php/is.exe
 
 jobs:
   build:
@@ -31,6 +35,7 @@ jobs:
             slug: windows-x64
             py_arch: x64
             wix_arch: x64
+            inno_arch: x64
             ffmpeg_arch: win64
 
           # GitHub-hosted Windows-on-ARM runner (Snapdragon / Ryzen AI class).
@@ -39,6 +44,7 @@ jobs:
             slug: windows-arm64
             py_arch: arm64
             wix_arch: arm64
+            inno_arch: arm64
             ffmpeg_arch: winarm64
 
           - os: macos-latest
@@ -48,6 +54,7 @@ jobs:
           - os: ubuntu-latest
             slug: linux-x64
             py_arch: x64
+            deb_arch: amd64
 
     steps:
       - name: Checkout
@@ -85,7 +92,12 @@ jobs:
       # dev stamp so the artifact name is never empty.
       #
       # msi_version is the same value reduced to a strict x.y.z numeric form,
-      # because Windows Installer rejects anything else in ProductVersion.
+      # because Windows Installer (and Inno's VersionInfoVersion) rejects
+      # anything else.
+      #
+      # deb_version keeps the prerelease information but rewrites it into a
+      # Debian-legal ordering: 1.2.0~rc1 sorts *before* 1.2.0, which is what a
+      # prerelease should do.
       # ------------------------------------------------------------------
       - name: Resolve version
         id: ver
@@ -97,13 +109,24 @@ jobs:
           else
             VERSION="v0.0.0-dev.${GITHUB_SHA::7}"
           fi
-          NUMERIC="${VERSION#v}"     # drop leading v
-          NUMERIC="${NUMERIC%%-*}"   # drop any -rc1 / -dev.abc1234 suffix
+          RAW="${VERSION#v}"          # drop leading v
+          NUMERIC="${RAW%%-*}"        # drop any -rc1 / -dev.abc1234 suffix
           if [[ ! "$NUMERIC" =~ ^[0-9]+(\.[0-9]+){0,3}$ ]]; then
             NUMERIC="0.0.0"
           fi
-          echo "version=${VERSION}"       >> "$GITHUB_OUTPUT"
-          echo "msi_version=${NUMERIC}"   >> "$GITHUB_OUTPUT"
+          SUFFIX="${RAW#"$NUMERIC"}"  # "" or "-rc1" / "-dev.abc1234"
+          if [[ -n "$SUFFIX" ]]; then
+            # ~ makes the prerelease sort below the final release in dpkg.
+            DEB_VERSION="${NUMERIC}~${SUFFIX#-}"
+          else
+            DEB_VERSION="${NUMERIC}"
+          fi
+          # Debian versions may not contain '_' or upper-case oddities.
+          DEB_VERSION="$(echo "$DEB_VERSION" | tr '_' '.' | tr -cd '0-9A-Za-z.+~-')"
+
+          echo "version=${VERSION}"        >> "$GITHUB_OUTPUT"
+          echo "msi_version=${NUMERIC}"    >> "$GITHUB_OUTPUT"
+          echo "deb_version=${DEB_VERSION}" >> "$GITHUB_OUTPUT"
           echo "basename=${APP_NAME}-${VERSION}-${{ matrix.slug }}" >> "$GITHUB_OUTPUT"
 
       # ==================================================================
@@ -233,8 +256,8 @@ jobs:
       # end-user machines. It proves integrity, not identity. Users will still
       # see a warning; real trust needs a paid OV/EV cert or an Apple Dev ID.
       #
-      # The thumbprint is exported so the MSI produced later can be signed with
-      # the *same* certificate instead of generating a second one.
+      # The thumbprint is exported so the MSI and the Inno Setup EXE produced
+      # later are signed with the *same* certificate.
       # ==================================================================
       - name: Sign Windows EXE (self-signed "Alok")
         id: winsign
@@ -336,15 +359,89 @@ jobs:
 
       # ==================================================================
       # WINDOWS PACKAGING
-      #   1. portable  -> <basename>.exe
-      #   2. installer -> <basename>.msi   (WiX v3: candle + light)
+      #   1. portable  -> <basename>-portable.exe
+      #   2. wizard    -> <basename>-Setup.exe   (Inno Setup 6: ISCC)
+      #   3. msi       -> <basename>.msi         (WiX v3: candle + light)
       # ==================================================================
       - name: Package portable EXE (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
           set -euo pipefail
-          cp "dist/${APP_NAME}.exe" "artifacts/${{ steps.ver.outputs.basename }}.exe"
+          cp "dist/${APP_NAME}.exe" "artifacts/${{ steps.ver.outputs.basename }}-portable.exe"
+
+      # windows-latest ships Inno Setup 6 preinstalled. windows-11-arm does not,
+      # so install it silently from the official stable download. ISCC is a
+      # 32-bit x86 tool and runs fine on arm64 under emulation - it only
+      # *targets* arm64, it does not have to be arm64 itself.
+      - name: Locate or install Inno Setup
+        id: inno
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          function Find-ISCC {
+            $probes = @(
+              "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+              "C:\Program Files\Inno Setup 6\ISCC.exe"
+            )
+            foreach ($p in $probes) { if (Test-Path $p) { return (Get-Item $p) } }
+            return (Get-ChildItem "C:\Program Files (x86)","C:\Program Files" `
+                      -Filter ISCC.exe -Recurse -Depth 3 -ErrorAction SilentlyContinue |
+                    Sort-Object FullName -Descending | Select-Object -First 1)
+          }
+
+          $iscc = Find-ISCC
+          if (-not $iscc) {
+            Write-Host "Inno Setup not preinstalled - downloading stable 6.x..."
+            $setup = Join-Path $env:RUNNER_TEMP "innosetup.exe"
+            Invoke-WebRequest -Uri $env:INNO_URL -OutFile $setup -UseBasicParsing
+            # /VERYSILENT keeps the wizard headless; /SP- kills the "this will
+            # install..." prompt; /NORESTART is belt and braces on a runner.
+            $p = Start-Process -FilePath $setup -Wait -PassThru `
+                   -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/SP-','/NORESTART','/NOCANCEL'
+            if ($p.ExitCode -ne 0) { throw "Inno Setup install failed ($($p.ExitCode))" }
+            $iscc = Find-ISCC
+          }
+          if (-not $iscc) { throw "ISCC.exe not found after installation." }
+
+          Write-Host "ISCC: $($iscc.FullName)"
+          "iscc=$($iscc.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Build Inno Setup installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          NUM_VERSION: ${{ steps.ver.outputs.msi_version }}
+          FULL_VERSION: ${{ steps.ver.outputs.version }}
+          APP_ARCH: ${{ matrix.inno_arch }}
+          OUT_BASENAME: ${{ steps.ver.outputs.basename }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          & "${{ steps.inno.outputs.iscc }}" /Qp `
+            "/DMyAppVersion=$env:NUM_VERSION" `
+            "/DMyAppFullVersion=$env:FULL_VERSION" `
+            "/DSourceDir=dist" `
+            "/DAppArch=$env:APP_ARCH" `
+            "/Oartifacts" `
+            "/F$env:OUT_BASENAME-Setup" `
+            "installer.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
+          Get-Item "artifacts\$env:OUT_BASENAME-Setup.exe" | Format-List Name, Length
+
+      - name: Sign Inno Setup installer (Windows)
+        if: runner.os == 'Windows' && steps.winsign.outputs.signtool != ''
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $setup = "artifacts\${{ steps.ver.outputs.basename }}-Setup.exe"
+          & "${{ steps.winsign.outputs.signtool }}" sign `
+            /sha1 "${{ steps.winsign.outputs.thumbprint }}" /fd SHA256 `
+            /tr http://timestamp.digicert.com /td SHA256 `
+            $setup
+          if ($LASTEXITCODE -ne 0) { throw "signtool failed on Setup EXE ($LASTEXITCODE)" }
+          Get-AuthenticodeSignature $setup | Format-List Status, StatusMessage
 
       # windows-latest ships WiX v3.14 preinstalled. windows-11-arm currently
       # does not, so fall back to the official binaries zip (x86 tooling, which
@@ -440,6 +537,9 @@ jobs:
           ditto "dist/${APP_NAME}.app" "$STAGE/${APP_NAME}.app"
           ln -s /Applications "$STAGE/Applications"
 
+          # A .DS_Store-free image still opens in icon view; keeping the
+          # window small and the volume named after the product is what makes
+          # it look like a normal Mac installer.
           hdiutil create \
             -volname "${PRODUCT_NAME}" \
             -srcfolder "$STAGE" \
@@ -455,23 +555,141 @@ jobs:
           ls -lh "artifacts/${NAME}.dmg"
 
       # ==================================================================
-      # LINUX PACKAGING -> <basename>.tar.gz
-      # Archived with a top-level directory so it does not explode into $PWD.
+      # LINUX PACKAGING -> <basename>.deb
+      #
+      # Layout:
+      #   /opt/UniversalDownloaderPlus/UniversalDownloaderPlus   (binary)
+      #   /opt/UniversalDownloaderPlus/ffmpeg/{ffmpeg,ffprobe}   (FFMPEG_DIR)
+      #   /usr/bin/universal-downloader-plus                     (symlink)
+      #   /usr/share/applications/*.desktop                      (menu entry)
+      #   /usr/share/icons/hicolor/<size>/apps/*.png             (icons)
+      #
+      # /opt is required because FFMPEG_DIR is dirname(sys.executable)/ffmpeg -
+      # dropping the binary straight into /usr/bin would make it look for
+      # /usr/bin/ffmpeg/ffmpeg.
       # ==================================================================
-      - name: Create tar.gz (Linux)
+      - name: Build .deb package (Linux)
+        if: runner.os == 'Linux'
+        env:
+          DEB_VERSION: ${{ steps.ver.outputs.deb_version }}
+          DEB_ARCH: ${{ matrix.deb_arch }}
+          OUT_BASENAME: ${{ steps.ver.outputs.basename }}
+        run: |
+          set -euo pipefail
+          ROOT="$(mktemp -d)/pkg"
+          OPTDIR="$ROOT/opt/${APP_NAME}"
+
+          mkdir -p "$ROOT/DEBIAN" \
+                   "$OPTDIR/ffmpeg" \
+                   "$ROOT/usr/bin" \
+                   "$ROOT/usr/share/applications" \
+                   "$ROOT/usr/share/doc/${DEB_PACKAGE}"
+
+          install -m 0755 "dist/${APP_NAME}"     "$OPTDIR/${APP_NAME}"
+          install -m 0755 dist/ffmpeg/ffmpeg     "$OPTDIR/ffmpeg/ffmpeg"
+          install -m 0755 dist/ffmpeg/ffprobe    "$OPTDIR/ffmpeg/ffprobe"
+          ln -s "/opt/${APP_NAME}/${APP_NAME}" "$ROOT/usr/bin/${DEB_PACKAGE}"
+
+          for SIZE in 16 24 32 48 64 96 128 256 512; do
+            SRC="src/universal_downloader/resources/icon-${SIZE}x${SIZE}.png"
+            [ -f "$SRC" ] || continue
+            DEST="$ROOT/usr/share/icons/hicolor/${SIZE}x${SIZE}/apps"
+            mkdir -p "$DEST"
+            install -m 0644 "$SRC" "$DEST/${DEB_PACKAGE}.png"
+          done
+
+          cat > "$ROOT/usr/share/applications/${DEB_PACKAGE}.desktop" <<EOF
+          [Desktop Entry]
+          Type=Application
+          Name=${PRODUCT_NAME}
+          GenericName=Video Downloader
+          Comment=Download video and audio from the web
+          Exec=/opt/${APP_NAME}/${APP_NAME} %U
+          Icon=${DEB_PACKAGE}
+          Terminal=false
+          Categories=AudioVideo;Network;Utility;
+          Keywords=youtube;download;video;audio;yt-dlp;
+          StartupWMClass=${APP_NAME}
+          EOF
+          chmod 0644 "$ROOT/usr/share/applications/${DEB_PACKAGE}.desktop"
+
+          install -m 0644 LICENSE "$ROOT/usr/share/doc/${DEB_PACKAGE}/copyright"
+
+          INSTALLED_KB="$(du -sk "$ROOT" | cut -f1)"
+
+          # Runtime deps are the Qt/WebEngine libs the frozen bundle dlopen()s
+          # but does not ship. The `a | b` alternatives cover the Ubuntu 24.04
+          # t64 ABI rename while staying installable on older releases.
+          cat > "$ROOT/DEBIAN/control" <<EOF
+          Package: ${DEB_PACKAGE}
+          Version: ${DEB_VERSION}
+          Section: video
+          Priority: optional
+          Architecture: ${DEB_ARCH}
+          Maintainer: ${MAINTAINER}
+          Installed-Size: ${INSTALLED_KB}
+          Depends: libc6, libglib2.0-0 | libglib2.0-0t64, libgl1, libegl1, libxkbcommon-x11-0, libxcb-cursor0, libxcb-icccm4, libxcb-image0, libxcb-keysyms1, libxcb-randr0, libxcb-render-util0, libxcb-shape0, libxcb-xinerama0, libnss3, libxdamage1, libxrandr2, libasound2t64 | libasound2, libatk-bridge2.0-0 | libatk-bridge2.0-0t64, libgbm1, libdbus-1-3, fontconfig
+          Homepage: https://github.com/al0k-commits/Universal-Downloader-Plus
+          Description: ${PRODUCT_NAME} - desktop video and audio downloader
+           PyQt6 + yt-dlp desktop downloader with an embedded Chromium browser,
+           persistent logins, playlist queueing and pause/resume/cancel support.
+           .
+           Static ffmpeg and ffprobe binaries are bundled, so no separate FFmpeg
+           installation is required.
+          EOF
+
+          cat > "$ROOT/DEBIAN/postinst" <<'EOF'
+          #!/bin/sh
+          set -e
+          if [ "$1" = "configure" ]; then
+            if command -v update-desktop-database >/dev/null 2>&1; then
+              update-desktop-database -q /usr/share/applications || true
+            fi
+            if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+              gtk-update-icon-cache -q -f -t /usr/share/icons/hicolor || true
+            fi
+          fi
+          exit 0
+          EOF
+
+          cat > "$ROOT/DEBIAN/postrm" <<'EOF'
+          #!/bin/sh
+          set -e
+          if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+            if command -v update-desktop-database >/dev/null 2>&1; then
+              update-desktop-database -q /usr/share/applications || true
+            fi
+            if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+              gtk-update-icon-cache -q -f -t /usr/share/icons/hicolor || true
+            fi
+          fi
+          exit 0
+          EOF
+
+          chmod 0755 "$ROOT/DEBIAN/postinst" "$ROOT/DEBIAN/postrm"
+
+          # --root-owner-group avoids shipping the runner's uid/gid in the deb.
+          dpkg-deb --build --root-owner-group -Zxz "$ROOT" \
+            "artifacts/${OUT_BASENAME}.deb"
+
+          echo "--- control ---"
+          dpkg-deb --info "artifacts/${OUT_BASENAME}.deb"
+          echo "--- contents ---"
+          dpkg-deb --contents "artifacts/${OUT_BASENAME}.deb" | head -n 20
+          ls -lh "artifacts/${OUT_BASENAME}.deb"
+
+      - name: Verify .deb installs cleanly (Linux)
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
-          NAME="${{ steps.ver.outputs.basename }}"
-          STAGE="$(mktemp -d)"
-          mkdir -p "$STAGE/${NAME}"
-          cp -a dist/. "$STAGE/${NAME}/"
-          chmod +x "$STAGE/${NAME}/${APP_NAME}" \
-                   "$STAGE/${NAME}/ffmpeg/ffmpeg" \
-                   "$STAGE/${NAME}/ffmpeg/ffprobe"
-          tar -czf "artifacts/${NAME}.tar.gz" -C "$STAGE" "${NAME}"
-          tar -tzf "artifacts/${NAME}.tar.gz" | head -n 10
-          ls -lh "artifacts/${NAME}.tar.gz"
+          DEB="artifacts/${{ steps.ver.outputs.basename }}.deb"
+          sudo apt-get install -y "./$DEB"
+          test -x "/opt/${APP_NAME}/${APP_NAME}"
+          test -x "/opt/${APP_NAME}/ffmpeg/ffmpeg"
+          test -L "/usr/bin/${DEB_PACKAGE}"
+          "/opt/${APP_NAME}/ffmpeg/ffmpeg" -version | head -n 1
+          sudo apt-get remove -y "${DEB_PACKAGE}"
+          echo "Package install/remove cycle OK."
 
       # ==================================================================
       # Checksums + upload
@@ -499,7 +717,7 @@ jobs:
             artifacts/*.exe
             artifacts/*.msi
             artifacts/*.dmg
-            artifacts/*.tar.gz
+            artifacts/*.deb
             artifacts/*.sha256
           retention-days: 14
           if-no-files-found: error
@@ -517,26 +735,27 @@ jobs:
           body: |
             ## Universal Downloader+ ${{ github.ref_name }}
 
-            Standalone builds for Windows, macOS and Linux — FFmpeg is bundled,
+            Native installers for Windows, macOS and Linux — FFmpeg is bundled,
             no separate install required.
 
-            | Platform | Installer | Portable |
+            | Platform | Recommended installer | Alternative |
             |---|---|---|
-            | Windows x64 (Intel/AMD)      | `UniversalDownloaderPlus-${{ github.ref_name }}-windows-x64.msi`   | `UniversalDownloaderPlus-${{ github.ref_name }}-windows-x64.exe`   |
-            | Windows arm64 (Snapdragon)   | `UniversalDownloaderPlus-${{ github.ref_name }}-windows-arm64.msi` | `UniversalDownloaderPlus-${{ github.ref_name }}-windows-arm64.exe` |
-            | macOS arm64 (Apple Silicon)  | `UniversalDownloaderPlus-${{ github.ref_name }}-macos-arm64.dmg`   | — |
-            | Linux x64                    | —                                                                  | `UniversalDownloaderPlus-${{ github.ref_name }}-linux-x64.tar.gz`  |
+            | Windows x64 (Intel/AMD)     | `UniversalDownloaderPlus-${{ github.ref_name }}-windows-x64-Setup.exe`   | `...-windows-x64.msi` · `...-windows-x64-portable.exe`   |
+            | Windows arm64 (Snapdragon)  | `UniversalDownloaderPlus-${{ github.ref_name }}-windows-arm64-Setup.exe` | `...-windows-arm64.msi` · `...-windows-arm64-portable.exe` |
+            | macOS arm64 (Apple Silicon) | `UniversalDownloaderPlus-${{ github.ref_name }}-macos-arm64.dmg`         | — |
+            | Linux x64 (Debian/Ubuntu)   | `UniversalDownloaderPlus-${{ github.ref_name }}-linux-x64.deb`           | — |
 
             Every asset ships a matching `.sha256` file.
 
-            **Windows:** the `.msi` is the recommended install — it places
-            `ffmpeg.exe`/`ffprobe.exe` next to the app and creates shortcuts.
-            The bare `.exe` is portable, but you must keep an `ffmpeg/` folder
-            beside it for merging/conversion to work.
+            **Windows:** `-Setup.exe` is the classic install wizard (Inno Setup)
+            — pick this one. The `.msi` is the same install for Group Policy /
+            `msiexec /i ... /qn` deployments. The `-portable.exe` needs no
+            install, but you must keep an `ffmpeg/` folder beside it.
 
             **macOS:** open the `.dmg` and drag the app into Applications.
 
-            **Linux:** `tar -xzf <file>.tar.gz && ./UniversalDownloaderPlus-*/UniversalDownloaderPlus`
+            **Linux:** `sudo apt install ./UniversalDownloaderPlus-*-linux-x64.deb`
+            then launch from your app menu or run `universal-downloader-plus`.
 
             > **Security notice:** these binaries are self-signed / ad-hoc signed.
             > Windows SmartScreen and macOS Gatekeeper will still warn on first run.
@@ -545,5 +764,5 @@ jobs:
             artifacts/*.exe
             artifacts/*.msi
             artifacts/*.dmg
-            artifacts/*.tar.gz
+            artifacts/*.deb
             artifacts/*.sha256

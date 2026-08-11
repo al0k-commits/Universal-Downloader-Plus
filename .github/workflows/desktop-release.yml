@@ -1,9 +1,9 @@
-name: Build & Release
+name: Desktop Build & Release
 
 on:
   push:
     tags:
-      - "v*"
+      - "desktop-v*"
   # Allows a dry-run build from the Actions tab without cutting a release.
   workflow_dispatch:
 
@@ -11,8 +11,14 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: desktop-release-${{ github.ref }}
   cancel-in-progress: false
+
+# Every `run:` step below executes relative to ./desktop, where the PyQt6
+# app, its pyproject.toml and the installer scripts live.
+defaults:
+  run:
+    working-directory: ./desktop
 
 env:
   APP_NAME: UniversalDownloaderPlus
@@ -88,8 +94,9 @@ jobs:
           pip install pyinstaller
 
       # ------------------------------------------------------------------
-      # Derive the version once. Tag pushes use the tag; manual runs get a
-      # dev stamp so the artifact name is never empty.
+      # Derive the version once. Tags look like desktop-v1.2.0; the
+      # "desktop-" prefix is stripped so artifact names stay clean. Manual
+      # runs get a dev stamp so the artifact name is never empty.
       #
       # msi_version is the same value reduced to a strict x.y.z numeric form,
       # because Windows Installer (and Inno's VersionInfoVersion) rejects
@@ -105,7 +112,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            VERSION="${GITHUB_REF_NAME}"
+            VERSION="${GITHUB_REF_NAME#desktop-}"
           else
             VERSION="v0.0.0-dev.${GITHUB_SHA::7}"
           fi
@@ -130,7 +137,8 @@ jobs:
           echo "basename=${APP_NAME}-${VERSION}-${{ matrix.slug }}" >> "$GITHUB_OUTPUT"
 
       # ==================================================================
-      # FFmpeg: fetch static ffmpeg + ffprobe into ./ffmpeg at the repo root.
+      # FFmpeg: fetch static ffmpeg + ffprobe + ffplay into ./ffmpeg (which
+      # resolves to desktop/ffmpeg via the working-directory default).
       # FFMPEG_DIR resolves to <exe dir>/ffmpeg when frozen, so these get
       # staged beside the binary further down.
       # ==================================================================
@@ -148,6 +156,7 @@ jobs:
           mkdir -p ffmpeg
           cp ffmpeg-*/bin/ffmpeg.exe  ffmpeg/
           cp ffmpeg-*/bin/ffprobe.exe ffmpeg/
+          cp ffmpeg-*/bin/ffplay.exe  ffmpeg/
           rm -rf ffmpeg-master-latest-*/ ffmpeg.zip
           ./ffmpeg/ffmpeg.exe -version | head -n 1
 
@@ -161,7 +170,8 @@ jobs:
           mkdir -p ffmpeg
           cp ffmpeg-master-latest-linux64-gpl/bin/ffmpeg  ffmpeg/
           cp ffmpeg-master-latest-linux64-gpl/bin/ffprobe ffmpeg/
-          chmod +x ffmpeg/ffmpeg ffmpeg/ffprobe
+          cp ffmpeg-master-latest-linux64-gpl/bin/ffplay  ffmpeg/
+          chmod +x ffmpeg/ffmpeg ffmpeg/ffprobe ffmpeg/ffplay
           rm -rf ffmpeg-master-latest-linux64-gpl ffmpeg-btbn.tar.xz
           ./ffmpeg/ffmpeg -version | head -n 1
 
@@ -179,7 +189,8 @@ jobs:
           mkdir -p ffmpeg
           cp "$(brew --prefix ffmpeg)/bin/ffmpeg"  ffmpeg/ffmpeg
           cp "$(brew --prefix ffmpeg)/bin/ffprobe" ffmpeg/ffprobe
-          chmod +x ffmpeg/ffmpeg ffmpeg/ffprobe
+          cp "$(brew --prefix ffmpeg)/bin/ffplay"  ffmpeg/ffplay
+          chmod +x ffmpeg/ffmpeg ffmpeg/ffprobe ffmpeg/ffplay
           ./ffmpeg/ffmpeg -version | head -n 1
 
       # ==================================================================
@@ -188,6 +199,9 @@ jobs:
       # ffmpeg is NOT bundled here -- it is staged next to the binary instead,
       # because _MEIPASS is deleted on exit and FFMPEG_DIR points at the exe
       # directory when frozen.
+      #
+      # --exclude-module drops heavy libs that are never imported (tkinter,
+      # pandas, matplotlib, numpy) so the onefile payload shrinks.
       # ==================================================================
       - name: Build with PyInstaller (Windows)
         if: runner.os == 'Windows'
@@ -201,6 +215,10 @@ jobs:
             --collect-all PyQt6.QtWebEngineCore \
             --collect-all qtawesome \
             --collect-all yt_dlp \
+            --exclude-module tkinter \
+            --exclude-module pandas \
+            --exclude-module matplotlib \
+            --exclude-module numpy \
             src/universal_downloader/__main__.py
 
       # GitHub's ubuntu-latest images carry heavy SDK/toolchain installs
@@ -223,6 +241,10 @@ jobs:
             --collect-all PyQt6.QtWebEngineCore \
             --collect-all qtawesome \
             --collect-all yt_dlp \
+            --exclude-module tkinter \
+            --exclude-module pandas \
+            --exclude-module matplotlib \
+            --exclude-module numpy \
             src/universal_downloader/__main__.py
 
       # macOS ignores --onefile for windowed apps and emits a .app bundle.
@@ -237,6 +259,10 @@ jobs:
             --collect-all PyQt6.QtWebEngineCore \
             --collect-all qtawesome \
             --collect-all yt_dlp \
+            --exclude-module tkinter \
+            --exclude-module pandas \
+            --exclude-module matplotlib \
+            --exclude-module numpy \
             src/universal_downloader/__main__.py
 
       # ==================================================================
@@ -256,7 +282,7 @@ jobs:
           # sys.executable inside a bundle is Contents/MacOS/<name>, so
           # FFMPEG_DIR resolves to Contents/MacOS/ffmpeg.
           mkdir -p "dist/${APP_NAME}.app/Contents/MacOS/ffmpeg"
-          cp ffmpeg/ffmpeg ffmpeg/ffprobe \
+          cp ffmpeg/ffmpeg ffmpeg/ffprobe ffmpeg/ffplay \
             "dist/${APP_NAME}.app/Contents/MacOS/ffmpeg/"
           ls -la "dist/${APP_NAME}.app/Contents/MacOS/ffmpeg/"
 
@@ -325,7 +351,8 @@ jobs:
           # executables we copied in after PyInstaller finished.
           codesign --force --sign - --timestamp=none \
             "$APP/Contents/MacOS/ffmpeg/ffmpeg" \
-            "$APP/Contents/MacOS/ffmpeg/ffprobe"
+            "$APP/Contents/MacOS/ffmpeg/ffprobe" \
+            "$APP/Contents/MacOS/ffmpeg/ffplay"
           codesign --force --deep --sign - "$APP"
           codesign --verify --deep --verbose=2 "$APP"
 
@@ -340,6 +367,7 @@ jobs:
         run: |
           file "dist/${APP_NAME}"
           test -x dist/ffmpeg/ffmpeg
+          test -x dist/ffmpeg/ffplay
           # Launch briefly under Xvfb; a clean timeout means it booted OK.
           timeout 25s xvfb-run -a "./dist/${APP_NAME}" || rc=$?
           if [ "${rc:-0}" -ne 0 ] && [ "${rc:-0}" -ne 124 ]; then
@@ -354,6 +382,7 @@ jobs:
           test -f "dist/${APP_NAME}.exe"
           test -f dist/ffmpeg/ffmpeg.exe
           test -f dist/ffmpeg/ffprobe.exe
+          test -f dist/ffmpeg/ffplay.exe
           echo "Artifacts present."
 
       - name: Verify build output (macOS)
@@ -361,6 +390,7 @@ jobs:
         run: |
           test -d "dist/${APP_NAME}.app"
           test -x "dist/${APP_NAME}.app/Contents/MacOS/ffmpeg/ffmpeg"
+          test -x "dist/${APP_NAME}.app/Contents/MacOS/ffmpeg/ffplay"
           echo "Bundle present."
 
       - name: Create artifacts directory
@@ -550,12 +580,12 @@ jobs:
           # A .DS_Store-free image still opens in icon view; keeping the
           # window small and the volume named after the product is what makes
           # it look like a normal Mac installer.
+          # UDBZ = bzip2-compressed read-only image: smaller than UDZO zlib.
           hdiutil create \
             -volname "${PRODUCT_NAME}" \
             -srcfolder "$STAGE" \
             -fs HFS+ \
-            -format UDZO \
-            -imagekey zlib-level=9 \
+            -format UDBZ \
             -ov \
             "artifacts/${NAME}.dmg"
 
@@ -569,7 +599,7 @@ jobs:
       #
       # Layout:
       #   /opt/UniversalDownloaderPlus/UniversalDownloaderPlus   (binary)
-      #   /opt/UniversalDownloaderPlus/ffmpeg/{ffmpeg,ffprobe}   (FFMPEG_DIR)
+      #   /opt/UniversalDownloaderPlus/ffmpeg/{ffmpeg,ffprobe,ffplay}
       #   /usr/bin/universal-downloader-plus                     (symlink)
       #   /usr/share/applications/*.desktop                      (menu entry)
       #   /usr/share/icons/hicolor/<size>/apps/*.png             (icons)
@@ -598,6 +628,7 @@ jobs:
           install -m 0755 "dist/${APP_NAME}"     "$OPTDIR/${APP_NAME}"
           install -m 0755 dist/ffmpeg/ffmpeg     "$OPTDIR/ffmpeg/ffmpeg"
           install -m 0755 dist/ffmpeg/ffprobe    "$OPTDIR/ffmpeg/ffprobe"
+          install -m 0755 dist/ffmpeg/ffplay     "$OPTDIR/ffmpeg/ffplay"
           ln -s "/opt/${APP_NAME}/${APP_NAME}" "$ROOT/usr/bin/${DEB_PACKAGE}"
 
           for SIZE in 16 24 32 48 64 96 128 256 512; do
@@ -644,8 +675,8 @@ jobs:
            PyQt6 + yt-dlp desktop downloader with an embedded Chromium browser,
            persistent logins, playlist queueing and pause/resume/cancel support.
            .
-           Static ffmpeg and ffprobe binaries are bundled, so no separate FFmpeg
-           installation is required.
+           Static ffmpeg, ffprobe and ffplay binaries are bundled, so no
+           separate FFmpeg installation is required.
           EOF
 
           cat > "$ROOT/DEBIAN/postinst" <<'EOF'
@@ -702,13 +733,15 @@ jobs:
           sudo apt-get install -y "./$DEB"
           test -x "/opt/${APP_NAME}/${APP_NAME}"
           test -x "/opt/${APP_NAME}/ffmpeg/ffmpeg"
+          test -x "/opt/${APP_NAME}/ffmpeg/ffplay"
           test -L "/usr/bin/${DEB_PACKAGE}"
           "/opt/${APP_NAME}/ffmpeg/ffmpeg" -version | head -n 1
           sudo apt-get remove -y "${DEB_PACKAGE}"
           echo "Package install/remove cycle OK."
 
       # ==================================================================
-      # Checksums + upload
+      # Checksums + upload (paths below are relative to the checkout root,
+      # so they are prefixed with desktop/)
       # ==================================================================
       - name: Generate SHA256 checksums
         shell: bash
@@ -730,11 +763,11 @@ jobs:
         with:
           name: ${{ steps.ver.outputs.basename }}
           path: |
-            artifacts/*.exe
-            artifacts/*.msi
-            artifacts/*.dmg
-            artifacts/*.deb
-            artifacts/*.sha256
+            desktop/artifacts/*.exe
+            desktop/artifacts/*.msi
+            desktop/artifacts/*.dmg
+            desktop/artifacts/*.deb
+            desktop/artifacts/*.sha256
           retention-days: 14
           if-no-files-found: error
 
@@ -743,23 +776,23 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: Universal Downloader+ ${{ github.ref_name }}
+          name: Universal Downloader+ ${{ steps.ver.outputs.version }}
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
           fail_on_unmatched_files: false
           body: |
-            ## Universal Downloader+ ${{ github.ref_name }}
+            ## Universal Downloader+ ${{ steps.ver.outputs.version }}
 
-            Native installers for Windows, macOS and Linux — FFmpeg is bundled,
-            no separate install required.
+            Native installers for Windows, macOS and Linux — ffmpeg, ffprobe
+            and ffplay are bundled, no separate FFmpeg install required.
 
             | Platform | Recommended installer | Alternative |
             |---|---|---|
-            | Windows x64 (Intel/AMD)     | `UniversalDownloaderPlus-${{ github.ref_name }}-windows-x64-Setup.exe`   | `...-windows-x64.msi` · `...-windows-x64-portable.exe`   |
-            | Windows arm64 (Snapdragon)  | `UniversalDownloaderPlus-${{ github.ref_name }}-windows-arm64-Setup.exe` | `...-windows-arm64.msi` · `...-windows-arm64-portable.exe` |
-            | macOS arm64 (Apple Silicon) | `UniversalDownloaderPlus-${{ github.ref_name }}-macos-arm64.dmg`         | — |
-            | Linux x64 (Debian/Ubuntu)   | `UniversalDownloaderPlus-${{ github.ref_name }}-linux-x64.deb`           | — |
+            | Windows x64 (Intel/AMD)     | `UniversalDownloaderPlus-${{ steps.ver.outputs.version }}-windows-x64-Setup.exe`   | `...-windows-x64.msi` · `...-windows-x64-portable.exe`   |
+            | Windows arm64 (Snapdragon)  | `UniversalDownloaderPlus-${{ steps.ver.outputs.version }}-windows-arm64-Setup.exe` | `...-windows-arm64.msi` · `...-windows-arm64-portable.exe` |
+            | macOS arm64 (Apple Silicon) | `UniversalDownloaderPlus-${{ steps.ver.outputs.version }}-macos-arm64.dmg`         | — |
+            | Linux x64 (Debian/Ubuntu)   | `UniversalDownloaderPlus-${{ steps.ver.outputs.version }}-linux-x64.deb`           | — |
 
             Every asset ships a matching `.sha256` file.
 
@@ -777,8 +810,8 @@ jobs:
             > Windows SmartScreen and macOS Gatekeeper will still warn on first run.
             > On macOS: `xattr -dr com.apple.quarantine /Applications/UniversalDownloaderPlus.app`
           files: |
-            artifacts/*.exe
-            artifacts/*.msi
-            artifacts/*.dmg
-            artifacts/*.deb
-            artifacts/*.sha256
+            desktop/artifacts/*.exe
+            desktop/artifacts/*.msi
+            desktop/artifacts/*.dmg
+            desktop/artifacts/*.deb
+            desktop/artifacts/*.sha256

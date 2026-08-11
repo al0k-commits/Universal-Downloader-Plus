@@ -2,7 +2,7 @@
 <!--
   WiX Toolset v3 source for the Universal Downloader+ MSI.
 
-  Compiled by .github/workflows/release.yml roughly like:
+  Compiled by .github/workflows/desktop-release.yml roughly like:
 
       candle.exe -nologo -arch x64 ^
                  -dProductVersion=1.0.0 ^
@@ -59,7 +59,9 @@
     <MajorUpgrade AllowSameVersionUpgrades="yes"
                   DowngradeErrorMessage="A newer version of $(var.ProductName) is already installed." />
 
-    <MediaTemplate EmbedCab="yes" />
+    <!-- CompressionLevel="high" = MSZip + LZX with the largest window, the
+         strongest safe setting for the x86 WiX toolchain. -->
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
     <!-- Add/Remove Programs metadata. -->
     <Icon Id="AppIcon.exe" SourceFile="$(var.SourceDir)\$(var.ExeName)" />
@@ -82,8 +84,8 @@
 
     <!--
       The application itself. FFMPEG_DIR resolves to <exe dir>\ffmpeg when the
-      app is frozen, so ffmpeg.exe / ffprobe.exe must land in a sibling folder,
-      exactly like the portable build.
+      app is frozen, so ffmpeg.exe / ffprobe.exe / ffplay.exe must land in a
+      sibling folder, exactly like the portable build.
     -->
     <ComponentGroup Id="ApplicationFiles">
       <Component Id="cmpMainExe" Directory="INSTALLFOLDER" Guid="*" Win64="yes">
@@ -116,6 +118,13 @@
         <File Id="filFfprobe"
               Name="ffprobe.exe"
               Source="$(var.SourceDir)\ffmpeg\ffprobe.exe"
+              KeyPath="yes" />
+      </Component>
+
+      <Component Id="cmpFfplay" Directory="FFMPEGFOLDER" Guid="*" Win64="yes">
+        <File Id="filFfplay"
+              Name="ffplay.exe"
+              Source="$(var.SourceDir)\ffmpeg\ffplay.exe"
               KeyPath="yes" />
       </Component>
 

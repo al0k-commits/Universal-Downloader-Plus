@@ -1,0 +1,133 @@
+name: Android Build & Release
+
+on:
+  push:
+    tags:
+      - "android-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  APP_NAME: UniversalDownloaderPlus
+  # Optional: set this secret to use EAS local builds. Without it the
+  # workflow falls back to a plain Gradle build (no Expo account needed).
+  EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+
+jobs:
+  build:
+    name: Build APK + AAB
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: android/package-lock.json
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install npm dependencies
+        working-directory: ./android
+        run: npm ci
+
+      # ------------------------------------------------------------------
+      # Two build paths, same outputs (artifacts/app-release.apk +
+      # artifacts/app-release.aab):
+      #
+      #   1. EAS Local Build  — used when EXPO_TOKEN is set. Requires an Expo
+      #      account + project ownership, but gives real EAS build configs.
+      #         eas build --platform android --profile preview    --local  -> APK
+      #         eas build --platform android --profile production --local  -> AAB
+      #
+      #   2. Plain Gradle     — default. No Expo account needed: `expo
+      #      prebuild` generates the native project, then gradlew assembles
+      #      the release APK and bundles the AAB directly.
+      # ------------------------------------------------------------------
+      - name: Build with EAS (local)
+        if: env.EXPO_TOKEN != ''
+        working-directory: ./android
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          npx eas-cli@latest init --non-interactive
+          npx eas-cli@latest build --platform android \
+            --profile preview --local --non-interactive \
+            --output artifacts/app-release.apk
+          npx eas-cli@latest build --platform android \
+            --profile production --local --non-interactive \
+            --output artifacts/app-release.aab
+
+      - name: Build with Gradle (expo prebuild)
+        if: env.EXPO_TOKEN == ''
+        working-directory: ./android
+        run: |
+          set -euo pipefail
+          npx expo prebuild --platform android --no-install --non-interactive
+          mkdir -p artifacts
+          ./android/gradlew --no-daemon :app:assembleRelease
+          ./android/gradlew --no-daemon :app:bundleRelease
+          cp android/app/build/outputs/apk/release/app-release.apk \
+             artifacts/app-release.apk
+          cp android/app/build/outputs/bundle/release/app-release.aab \
+             artifacts/app-release.aab
+
+      - name: Verify build outputs
+        working-directory: ./android
+        run: |
+          test -f artifacts/app-release.apk
+          test -f artifacts/app-release.aab
+          ls -lh artifacts/
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-android
+          path: |
+            android/artifacts/app-release.apk
+            android/artifacts/app-release.aab
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Publish to GitHub Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Universal Downloader+ (Android) ${{ github.ref_name }}
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: false
+          body: |
+            ## Universal Downloader+ (Android) ${{ github.ref_name }}
+
+            | Format | File |
+            |---|---|
+            | APK (install directly) | `app-release.apk` |
+            | AAB (Play Store upload) | `app-release.aab` |
+
+            The APK installs straight from the browser/Downloads. The AAB is
+            the Play Store upload artifact and is not directly installable.
+
+            Point the app at your backend in `android/app.json`
+            (`extra.serverBaseUrl`) — it needs a running instance of
+            `android/server/server.py` (FastAPI + yt-dlp) to extract and
+            download media.
+          files: |
+            android/artifacts/app-release.apk
+            android/artifacts/app-release.aab

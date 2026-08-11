@@ -1,7 +1,7 @@
 ; ---------------------------------------------------------------------------
 ;  Inno Setup 6 script for Universal Downloader+
 ;
-;  Compiled by .github/workflows/release.yml roughly like:
+;  Compiled by .github/workflows/desktop-release.yml roughly like:
 ;
 ;      iscc.exe /Qp ^
 ;        /DMyAppVersion=1.0.0 ^
@@ -90,9 +90,10 @@ ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=artifacts
 OutputBaseFilename={#MyAppShortName}-{#MyAppFullVersion}-windows-{#AppArch}-Setup
 
-Compression=lzma2/fast
-SolidCompression=no
-LZMANumBlockThreads=2
+; Solid + lzma2/normal is the largest safely-usable ratio for the 32-bit
+; ISCC compiler. ultra64/max crash it with Out of Memory on big payloads.
+Compression=lzma2/normal
+SolidCompression=yes
 WizardStyle=modern
 SetupIconFile=src\universal_downloader\resources\icon.ico
 UninstallDisplayName={#MyAppName} {#MyAppFullVersion}
@@ -114,8 +115,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "{#SourceDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 
 ; FFMPEG_DIR resolves to <exe dir>\ffmpeg when the app is frozen, so the
-; helper binaries must land in a sibling folder - exactly like the portable
-; build and the MSI layout.
+; helper binaries (ffmpeg.exe, ffprobe.exe, ffplay.exe) must land in a
+; sibling folder - exactly like the portable build and the MSI layout.
 Source: "{#SourceDir}\ffmpeg\*"; DestDir: "{app}\ffmpeg"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]

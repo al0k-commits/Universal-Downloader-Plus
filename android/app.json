@@ -1,0 +1,17 @@
+{
+  "expo": {
+    "name": "Universal Downloader+",
+    "slug": "universal-downloader-plus",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "android": {
+      "package": "com.al0k.universaldownloaderplus",
+      "versionCode": 1
+    },
+    "extra": {
+      "serverBaseUrl": "http://192.168.1.100:8000"
+    }
+  }
+}

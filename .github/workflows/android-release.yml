@@ -75,31 +75,55 @@ jobs:
       - name: Build with Gradle (expo prebuild)
         if: env.EXPO_TOKEN == ''
         working-directory: ./android
+        env:
+          CI: "1"
         run: |
           set -euo pipefail
-          npx expo prebuild --platform android --no-install --non-interactive
+
+          # The Expo root IS android/, so prebuild nests the native project
+          # at android/android/. gradlew must run from that nested directory,
+          # never from the Expo root (which has no settings.gradle).
+          npx expo prebuild --platform android --no-install
+          test -f android/settings.gradle || {
+            echo "::error::expo prebuild did not produce android/settings.gradle"
+            ls -la
+            exit 1
+          }
+
           mkdir -p artifacts
-          ./android/gradlew --no-daemon :app:assembleRelease
-          ./android/gradlew --no-daemon :app:bundleRelease
-          cp android/app/build/outputs/apk/release/app-release.apk \
-             artifacts/app-release.apk
-          cp android/app/build/outputs/bundle/release/app-release.aab \
-             artifacts/app-release.aab
+          cd android
+          ./gradlew --no-daemon :app:assembleRelease
+          ./gradlew --no-daemon :app:bundleRelease
+          cd ..
+          # Outputs stay in the nested native project (android/android/app/
+          # build/outputs/...) and are picked up from there by the upload step.
 
       - name: Verify build outputs
         working-directory: ./android
         run: |
-          test -f artifacts/app-release.apk
-          test -f artifacts/app-release.aab
-          ls -lh artifacts/
+          set -euo pipefail
+          # EAS path writes to artifacts/; the Gradle path outputs into the
+          # nested native project. Exactly one APK/AAB pair must exist.
+          if [ -f artifacts/app-release.apk ] && [ -f artifacts/app-release.aab ]; then
+            ls -lh artifacts/
+          elif [ -f android/app/build/outputs/apk/release/app-release.apk ] && \
+               [ -f android/app/build/outputs/bundle/release/app-release.aab ]; then
+            ls -lh android/app/build/outputs/apk/release/ \
+                 android/app/build/outputs/bundle/release/
+          else
+            echo "::error::Neither build path produced an APK + AAB pair"
+            exit 1
+          fi
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.APP_NAME }}-android
           path: |
-            android/artifacts/app-release.apk
-            android/artifacts/app-release.aab
+            android/artifacts/*.apk
+            android/artifacts/*.aab
+            android/android/app/build/outputs/apk/release/app-release.apk
+            android/android/app/build/outputs/bundle/release/app-release.aab
           retention-days: 14
           if-no-files-found: error
 
@@ -129,5 +153,7 @@ jobs:
             `android/server/server.py` (FastAPI + yt-dlp) to extract and
             download media.
           files: |
-            android/artifacts/app-release.apk
-            android/artifacts/app-release.aab
+            android/artifacts/*.apk
+            android/artifacts/*.aab
+            android/android/app/build/outputs/apk/release/app-release.apk
+            android/android/app/build/outputs/bundle/release/app-release.aab

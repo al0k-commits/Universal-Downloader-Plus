@@ -222,13 +222,16 @@ jobs:
             src/universal_downloader/__main__.py
 
       # GitHub's ubuntu-latest images carry heavy SDK/toolchain installs
-      # (/usr/share/dotnet, Android SDK, GHC) that eat ~20GB+ of the 14GB
-      # runner disk. Removing them frees space for the .deb packaging step,
-      # which otherwise dies with "tar: stdout: write error: No space left".
+      # (/usr/share/dotnet, Android SDK, GHC, CodeQL) that eat ~20GB+ of the
+      # 14GB runner disk. Removing them frees space for the .deb packaging
+      # step, which otherwise dies with "tar: stdout: write error: No space
+      # left" — the ffplay addition pushed the uncompressed payload to
+      # ~665MB, so this purge is mandatory.
       - name: Free up disk space (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL
           df -h
 
       - name: Build with PyInstaller (Linux)
@@ -715,7 +718,9 @@ jobs:
           sudo chown -R root:root "$ROOT"
 
           # --root-owner-group avoids shipping the runner's uid/gid in the deb.
-          # -Zgzip keeps the compression pipeline light for large bundles.
+          # -Zgzip = fast gzip, NOT the default xz: xz needs several GB of RAM
+          # for the ~665MB uncompressed payload (ffplay included) and can OOM
+          # the 7GB runner. gzip trades a bit of size for a working build.
           dpkg-deb --build --root-owner-group -Zgzip "$ROOT" \
             "artifacts/${OUT_BASENAME}.deb"
 

@@ -155,14 +155,14 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
-          curl -fsSL --retry 3 -o ffmpeg-static.tar.xz \
-            https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
-          tar -xJf ffmpeg-static.tar.xz
+          curl -fsSL --retry 3 -o ffmpeg-btbn.tar.xz \
+            https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+          tar -xJf ffmpeg-btbn.tar.xz
           mkdir -p ffmpeg
-          cp ffmpeg-*-static/ffmpeg  ffmpeg/
-          cp ffmpeg-*-static/ffprobe ffmpeg/
+          cp ffmpeg-master-latest-linux64-gpl/bin/ffmpeg  ffmpeg/
+          cp ffmpeg-master-latest-linux64-gpl/bin/ffprobe ffmpeg/
           chmod +x ffmpeg/ffmpeg ffmpeg/ffprobe
-          rm -rf ffmpeg-*-static ffmpeg-static.tar.xz
+          rm -rf ffmpeg-master-latest-linux64-gpl ffmpeg-btbn.tar.xz
           ./ffmpeg/ffmpeg -version | head -n 1
 
       # macos-latest is arm64. Most "static macOS ffmpeg" mirrors publish

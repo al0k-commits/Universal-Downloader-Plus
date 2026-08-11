@@ -203,6 +203,16 @@ jobs:
             --collect-all yt_dlp \
             src/universal_downloader/__main__.py
 
+      # GitHub's ubuntu-latest images carry heavy SDK/toolchain installs
+      # (/usr/share/dotnet, Android SDK, GHC) that eat ~20GB+ of the 14GB
+      # runner disk. Removing them frees space for the .deb packaging step,
+      # which otherwise dies with "tar: stdout: write error: No space left".
+      - name: Free up disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h
+
       - name: Build with PyInstaller (Linux)
         if: runner.os == 'Linux'
         run: |

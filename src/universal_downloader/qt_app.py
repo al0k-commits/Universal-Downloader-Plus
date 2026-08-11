@@ -4,8 +4,9 @@ Universal Downloader+ — 4K Video Downloader+ style desktop app.
 PyQt6 + QWebEngine in-app browser with ad-blocking, download manager,
 detailed format-selection modal, pause/resume/cancel via yt-dlp hooks.
 
-Requires ffmpeg.exe / ffprobe.exe / yt-dlp.exe inside the ffmpeg/ folder at the
-repository root (dev) or next to the frozen executable (PyInstaller build).
+Requires ffmpeg / ffprobe (ffmpeg.exe / ffprobe.exe on Windows) inside the
+ffmpeg/ folder at the repository root (dev) or next to the frozen executable
+(PyInstaller build). yt-dlp is bundled as a Python package.
 """
 
 import os
@@ -72,7 +73,7 @@ def get_resource_path(filename: str) -> str:
     return os.path.join(base, filename)
 
 
-# Third-party binaries (ffmpeg.exe, ffprobe.exe, yt-dlp.exe) live here.
+# Third-party binaries (ffmpeg, ffprobe) live here.
 # In dev this is <repo_root>/ffmpeg; when frozen it is <exe_dir>/ffmpeg.
 FFMPEG_DIR = os.path.join(BASE_DIR, "ffmpeg")
 
@@ -3543,8 +3544,11 @@ def main():
     if os.path.exists(app_icon_path):
         win.setWindowIcon(QIcon(app_icon_path))
 
+    # yt-dlp ships as the bundled Python package, not a standalone binary.
+    # Only ffmpeg/ffprobe need to exist next to the app.
+    exe = ".exe" if os.name == "nt" else ""
     missing = [
-        name for name in ("ffmpeg.exe", "ffprobe.exe", "yt-dlp.exe")
+        name for name in (f"ffmpeg{exe}", f"ffprobe{exe}")
         if not os.path.exists(os.path.join(FFMPEG_DIR, name))
     ]
     if missing:

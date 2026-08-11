@@ -668,8 +668,14 @@ jobs:
 
           chmod 0755 "$ROOT/DEBIAN/postinst" "$ROOT/DEBIAN/postrm"
 
+          # Fix ownership: dpkg-deb expects root-owned files, but the runner
+          # created them as a non-root user. Without this, tar inside dpkg-deb
+          # can hit write errors on the large payload.
+          sudo chown -R root:root "$ROOT"
+
           # --root-owner-group avoids shipping the runner's uid/gid in the deb.
-          dpkg-deb --build --root-owner-group -Zxz "$ROOT" \
+          # -Zgzip keeps the compression pipeline light for large bundles.
+          dpkg-deb --build --root-owner-group -Zgzip "$ROOT" \
             "artifacts/${OUT_BASENAME}.deb"
 
           echo "--- control ---"

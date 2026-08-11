@@ -90,8 +90,8 @@ ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=artifacts
 OutputBaseFilename={#MyAppShortName}-{#MyAppFullVersion}-windows-{#AppArch}-Setup
 
-Compression=lzma2/ultra64
-SolidCompression=yes
+Compression=lzma2/fast
+SolidCompression=no
 LZMANumBlockThreads=2
 WizardStyle=modern
 SetupIconFile=src\universal_downloader\resources\icon.ico

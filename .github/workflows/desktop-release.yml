@@ -231,7 +231,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /opt/hostedtoolcache/CodeQL
+            /usr/local/share/boost /opt/hostedtoolcache/CodeQL
           df -h
 
       - name: Build with PyInstaller (Linux)
@@ -622,6 +622,7 @@ jobs:
           ROOT="$(mktemp -d)/pkg"
           OPTDIR="$ROOT/opt/${APP_NAME}"
 
+          mkdir -p artifacts
           mkdir -p "$ROOT/DEBIAN" \
                    "$OPTDIR/ffmpeg" \
                    "$ROOT/usr/bin" \
@@ -717,12 +718,10 @@ jobs:
           # can hit write errors on the large payload.
           sudo chown -R root:root "$ROOT"
 
-          # --root-owner-group avoids shipping the runner's uid/gid in the deb.
           # -Zgzip = fast gzip, NOT the default xz: xz needs several GB of RAM
           # for the ~665MB uncompressed payload (ffplay included) and can OOM
           # the 7GB runner. gzip trades a bit of size for a working build.
-          dpkg-deb --build --root-owner-group -Zgzip "$ROOT" \
-            "artifacts/${OUT_BASENAME}.deb"
+          dpkg-deb -Zgzip --build "$ROOT" "artifacts/${OUT_BASENAME}.deb"
 
           echo "--- control ---"
           dpkg-deb --info "artifacts/${OUT_BASENAME}.deb"
@@ -784,7 +783,8 @@ jobs:
           name: Universal Downloader+ ${{ steps.ver.outputs.version }}
           generate_release_notes: true
           draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: false
+          make_latest: true
           fail_on_unmatched_files: false
           body: |
             ## Universal Downloader+ ${{ steps.ver.outputs.version }}

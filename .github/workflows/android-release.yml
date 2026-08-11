@@ -135,7 +135,8 @@ jobs:
           name: Universal Downloader+ (Android) ${{ github.ref_name }}
           generate_release_notes: true
           draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: false
+          make_latest: true
           fail_on_unmatched_files: false
           body: |
             ## Universal Downloader+ (Android) ${{ github.ref_name }}
